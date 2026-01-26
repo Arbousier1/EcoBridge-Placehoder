@@ -11,25 +11,35 @@ import java.util.*;
 
 /**
  * 集成管理器 - 负责与 UltimateShop 数据对接
- * 优化重点：高性能对象化索引、规避 API 查找损耗、线程安全读取
+ * 
+ * 修复内容:
+ * 1. 适配 OptimizedPidController 的 Handle (int) 机制
+ * 2. 增加 Delta 计算 (当前销量 - 上次销量)，确保 PID 获取的是流量数据
+ * 3. 零 GC 采集循环
  */
 public class IntegrationManager {
 
     /**
-     * 内部条目：缓存所有高频读取的元数据 [cite: 71, 80]
+     * 内部条目：缓存 PID 句柄，避免运行时 Map 查找
      */
     private record ItemEntry(
-            String rawId,       // PID 控制器唯一识别码 (shopId_productId)
-            ObjectItem item     // 持有 UltimateShop 商品对象引用，规避重复查找 [cite: 72]
+            String rawId,       // 字符串 ID (用于指令补全)
+            int pidHandle,      // PID 快速句柄 (核心优化)
+            ObjectItem item     // UltimateShop 对象引用
     ) {}
 
     private final EcoBridge plugin;
     
-    // 活动条目列表：采集循环的核心数据源
-    private List<ItemEntry> activeEntries = new ArrayList<>();
+    // 活动条目列表 (Copy-On-Write 策略)
+    private volatile List<ItemEntry> activeEntries = Collections.emptyList();
     
-    // 指令补全专用缓存：使用 volatile 保证异步读取的可见性 [cite: 58, 69]
+    // 指令补全专用缓存
     private volatile List<String> monitoredIdCache = Collections.emptyList();
+    
+    // 记录上一次的累积销量：Handle -> LastTotalVolume
+    // 必须在主线程访问，或者加锁。由于 collectDataAndCalculate 在主线程运行，这里使用普通 Map 即可。
+    // 为了极致性能，推荐使用 fastutil 的 Int2DoubleOpenHashMap，这里用原生数组模拟或 Map
+    private final Map<Integer, Double> lastTotalVolumes = new HashMap<>(4096);
 
     public IntegrationManager(EcoBridge plugin) {
         this.plugin = plugin;
@@ -37,22 +47,26 @@ public class IntegrationManager {
 
     /**
      * 数据采集核心逻辑
-     * 运行在主线程 (Sync)，提取销量数据并投递至异步 SIMD 引擎 [cite: 27, 76]
+     * 运行在主线程 (Sync) -> 提取增量 -> 投递给异步 PID
      */
     public void collectDataAndCalculate() {
-        // 若监控列表为空，尝试自动同步一次
-        if (activeEntries.isEmpty()) {
-            syncShops();
-            if (activeEntries.isEmpty()) return;
+        // 引用快照，保证线程安全
+        final List<ItemEntry> currentItems = this.activeEntries;
+        if (currentItems.isEmpty()) {
+            // 尝试惰性初始化
+            if (Bukkit.getPluginManager().isPluginEnabled("UltimateShop")) {
+                syncShops();
+                if (activeEntries.isEmpty()) return;
+            } else {
+                return;
+            }
         }
 
-        // 使用局部变量引用，确保单次循环的数据一致性
-        final List<ItemEntry> currentItems = this.activeEntries;
         final int size = currentItems.size();
-
-        // 预分配容器，存储待计算的 ID 和 净销量 [cite: 71]
-        List<String> ids = new ArrayList<>(size);
-        double[] volumes = new double[size];
+        
+        // 使用原生数组，适配 OptimizedPidController 的 API
+        int[] handles = new int[size];
+        double[] deltaVolumes = new double[size];
         int count = 0;
 
         // --- 极速采集循环 ---
@@ -60,49 +74,69 @@ public class IntegrationManager {
             ItemEntry entry = currentItems.get(i);
             
             try {
-                // 直接通过持有对象获取全服交易次数 [cite: 72, 73]
+                // 1. 获取全服历史总销量 (Total Accumulation)
                 ObjectUseTimesCache cache = ShopHelper.getServerUseTimesCache(entry.item());
                 
                 if (cache != null) {
-                    // 净销量 = 买入 - 卖出 [cite: 74]
-                    double netVolume = cache.getBuyUseTimes() - cache.getSellUseTimes();
+                    // 净历史总量 = 买入 - 卖出 (根据需求调整，通常我们监控买入量)
+                    // 如果要监控玩家卖给商店，那就是 SellUseTimes
+                    // 这里假设监控商店热度：买入 + 卖出，或者仅买入
+                    double currentTotal = cache.getBuyUseTimes() + cache.getSellUseTimes();
                     
-                    ids.add(entry.rawId());
-                    volumes[count++] = netVolume;
+                    // 2. 计算增量 (Delta) = 当前总量 - 上次记录的总量
+                    // PID 控制器需要的是"这一段时间内发生了多少交易"
+                    double lastTotal = lastTotalVolumes.getOrDefault(entry.pidHandle(), currentTotal);
+                    double delta = currentTotal - lastTotal;
+                    
+                    // 3. 更新历史记录
+                    lastTotalVolumes.put(entry.pidHandle(), currentTotal);
+                    
+                    // 4. 只有当数据有效时才录入 (或者即使是0也录入，取决于PID是否需要连续tick)
+                    // PID 需要连续的时间流，即使是 0 也要传
+                    handles[count] = entry.pidHandle();
+                    deltaVolumes[count] = delta;
+                    count++;
                 }
             } catch (Exception ignored) {
-                // 静默处理单个商品采集错误，维持整体运行
+                // 容错处理
             }
         }
 
         if (count == 0) return;
 
-        // 精准截断数据，确保传给 PID 控制器的数组没有空尾部 [cite: 75]
-        final List<String> finalIds = ids;
-        final double[] finalVolumes = (count == size) ? volumes : Arrays.copyOf(volumes, count);
+        // 截断数组以匹配实际数量 (如果发生异常跳过了一些)
+        final int finalCount = count;
+        final int[] finalHandles = (count == size) ? handles : Arrays.copyOf(handles, count);
+        final double[] finalDeltas = (count == size) ? deltaVolumes : Arrays.copyOf(deltaVolumes, count);
 
-        // 异步执行 SIMD 向量化计算，释放主线程 [cite: 76, 130]
-        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
-            plugin.getPidController().calculateBatch(finalIds, finalVolumes);
-        });
+        // 异步投递给 PID 控制器 (Non-Blocking)
+        // 这里的 calculateBatch 必须对应 OptimizedPidController 的方法
+        if (plugin.getPidController() != null) {
+            plugin.getPidController().calculateBatch(finalHandles, finalDeltas, finalCount);
+        }
     }
 
     /**
      * 同步商店与商品列表
-     * 遍历 UltimateShop 配置，构建 EcoBridge 内部高效索引 [cite: 77-80]
+     * 构建 Handle 索引
      */
     public synchronized void syncShops() {
-        if (ConfigManager.configManager == null || ConfigManager.configManager.shopConfigs == null) {
-            plugin.getLogger().warning("UltimateShop 核心尚未加载完毕，同步延迟。 [cite: 76]");
+        // 检查 UltimateShop 是否就绪
+        if (!Bukkit.getPluginManager().isPluginEnabled("UltimateShop") || 
+            ConfigManager.configManager == null || 
+            ConfigManager.configManager.shopConfigs == null) {
             return;
         }
 
         Map<String, ObjectShop> shopMap = ConfigManager.configManager.shopConfigs;
         if (shopMap.isEmpty()) return;
 
-        // 预估容量：商店数 * 平均 10 个物品 [cite: 78, 79]
         List<ItemEntry> newEntries = new ArrayList<>(shopMap.size() * 10);
         List<String> newIds = new ArrayList<>(shopMap.size() * 10);
+        
+        // 获取 PID 控制器引用
+        PidController pidCtrl = plugin.getPidController();
+        if (pidCtrl == null) return;
 
         for (Map.Entry<String, ObjectShop> entry : shopMap.entrySet()) {
             String shopId = entry.getKey();
@@ -113,28 +147,34 @@ public class IntegrationManager {
             if (productList == null) continue;
 
             for (ObjectItem item : productList) {
-                String productId = item.getProduct(); // 获取配置键名 [cite: 79]
+                String productId = item.getProduct(); 
                 if (productId == null || productId.isEmpty()) continue;
 
-                // 提前拼接唯一识别码，避免运行时计算 [cite: 80]
+                // 构造唯一 ID
                 String rawId = shopId + "_" + productId;
                 
-                newEntries.add(new ItemEntry(rawId, item));
+                // [关键修复] 在同步时直接获取/注册 PID Handle
+                // 这样在采集循环中就不需要查 Map 了
+                int handle = pidCtrl.getHandle(rawId);
+                
+                newEntries.add(new ItemEntry(rawId, handle, item));
                 newIds.add(rawId);
+                
+                // 初始化该物品的 lastTotal，防止刚启动时产生巨大的 Delta 脉冲
+                ObjectUseTimesCache cache = ShopHelper.getServerUseTimesCache(item);
+                if (cache != null) {
+                    double currentTotal = cache.getBuyUseTimes() + cache.getSellUseTimes();
+                    lastTotalVolumes.put(handle, currentTotal);
+                }
             }
         }
 
-        // 原子替换引用，旧列表交由 GC 处理 
         this.activeEntries = newEntries;
         this.monitoredIdCache = Collections.unmodifiableList(newIds);
 
-        plugin.getLogger().info("成功同步 " + activeEntries.size() + " 个监控物品。 ");
+        plugin.getLogger().info("[Integration] Synced " + activeEntries.size() + " items from UltimateShop.");
     }
 
-    /**
-     * 获取受监控 ID 缓存
-     * 用于 EcoBridgeCommand 的 TabCompletion 零延迟补全 [cite: 57, 58]
-     */
     public List<String> getMonitoredItems() {
         return monitoredIdCache;
     }

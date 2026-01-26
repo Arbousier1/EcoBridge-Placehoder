@@ -1,105 +1,126 @@
 package top.ellan.ecobridge;
 
+import jdk.incubator.vector.DoubleVector;
 import jdk.incubator.vector.VectorSpecies;
 import org.bukkit.Bukkit;
+import org.bukkit.scheduler.BukkitTask;
 
 import java.lang.management.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.List;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * PerformanceMonitor - 性能监控和诊断
+ * PerformanceMonitor (Thread-Safe Edition)
  * 
- * 功能:
- * 1. SIMD 向量化率统计
- * 2. GC 压力监控
- * 3. 内存使用分析
- * 4. 数据库性能追踪
- * 5. 热点方法识别
+ * 修复:
+ * 1. 解决了 threadBean, youngGC, oldGC 未使用的警告 (现在已加入报告)
+ * 2. 保持了 Paper/Spigot 的主线程安全原则
+ * 3. 增强了 GC 和线程状态的监控输出
  */
 public class PerformanceMonitor {
     
     private final EcoBridge plugin;
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
-        Thread.ofVirtual().factory()
-    );
+    private final ScheduledExecutorService scheduler;
+    private BukkitTask syncCacheTask;
     
-    // 指标收集
+    // ==================== 线程安全的计数器 ====================
     private final LongAdder totalCalculations = new LongAdder();
     private final LongAdder simdCalculations = new LongAdder();
     private final LongAdder scalarCalculations = new LongAdder();
     private final LongAdder dbWrites = new LongAdder();
     private final LongAdder dbReads = new LongAdder();
     
-    // 性能计数器
     private final ConcurrentHashMap<String, PerformanceCounter> counters = new ConcurrentHashMap<>();
     
-    // JVM 监控
+    // ==================== JVM 监控 Bean ====================
     private final MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
-    private final ThreadMXBean threadBean = ManagementFactory.getThreadMXBean();
-    private final GarbageCollectorMXBean youngGC;
-    private final GarbageCollectorMXBean oldGC;
+    private final ThreadMXBean threadBean = ManagementFactory.getThreadMXBean(); // [Fix] 现在被使用了
+    private GarbageCollectorMXBean youngGC; // [Fix] 现在被使用了
+    private GarbageCollectorMXBean oldGC;   // [Fix] 现在被使用了
     
-    // 基准测试结果
-    private volatile long simdBandwidth = 0;  // GB/s
+    // ==================== 缓存状态 ====================
+    private volatile double[] cachedTps = new double[]{20.0, 20.0, 20.0};
+    private volatile int cachedPlayerCount = 0;
+    private final int logInterval;
+    
+    private volatile long simdBandwidth = 0;
     private volatile int vectorLanes = 0;
     
     public PerformanceMonitor(EcoBridge plugin) {
         this.plugin = plugin;
         
-        // 获取 GC Bean
-        var gcBeans = ManagementFactory.getGarbageCollectorMXBeans();
-        youngGC = gcBeans.size() > 0 ? gcBeans.get(0) : null;
-        oldGC = gcBeans.size() > 1 ? gcBeans.get(1) : null;
+        // 1. Config (Main Thread)
+        this.logInterval = plugin.getConfig().getInt("monitoring.log-interval", 300);
         
-        // 启动基准测试
+        // 2. JVM Beans
+        detectGCBeans();
+        
+        // 3. Scheduler
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(
+            r -> Thread.ofVirtual().name("EcoBridge-Monitor").unstarted(r)
+        );
+        
+        // 4. Sync Task for Bukkit API
+        this.syncCacheTask = Bukkit.getScheduler().runTaskTimer(plugin, this::updateServerStateCache, 100L, 100L);
+        
+        // 5. Benchmark
         benchmarkSIMD();
         
-        // 启动定期监控
+        // 6. Start Monitor
         startMonitoring();
     }
+
+    private void updateServerStateCache() {
+        try {
+            double[] tps = Bukkit.getTPS();
+            if (tps != null) {
+                this.cachedTps = tps;
+            }
+            this.cachedPlayerCount = Bukkit.getOnlinePlayers().size();
+        } catch (Throwable ignored) {}
+    }
+
+    private void detectGCBeans() {
+        List<GarbageCollectorMXBean> gcBeans = ManagementFactory.getGarbageCollectorMXBeans();
+        for (GarbageCollectorMXBean bean : gcBeans) {
+            String name = bean.getName().toLowerCase();
+            if (name.contains("young") || name.contains("eden") || name.contains("copy") || name.contains("scavenge")) {
+                youngGC = bean;
+            } else if (name.contains("old") || name.contains("tenured") || name.contains("mark") || name.contains("global")) {
+                oldGC = bean;
+            } else if (name.contains("g1")) {
+                if (name.contains("young")) youngGC = bean; else oldGC = bean;
+            } else if (name.contains("shenandoah") || name.contains("zgc")) {
+                oldGC = bean;
+            }
+        }
+    }
     
-    /**
-     * SIMD 基准测试
-     */
     private void benchmarkSIMD() {
         Thread.ofVirtual().start(() -> {
             try {
-                var species = jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED;
+                VectorSpecies<Double> species = DoubleVector.SPECIES_PREFERRED;
                 vectorLanes = species.length();
-                
-                int size = 1024 * 1024;  // 1M doubles = 8MB
+                int size = 1024 * 1024;
                 double[] data = new double[size];
                 
-                // 预热
-                for (int i = 0; i < 10; i++) {
-                    vectorAdd(data, species);
-                }
+                for (int i = 0; i < 50; i++) vectorAdd(data, species);
                 
-                // 测试
                 long startNs = System.nanoTime();
                 int iterations = 100;
-                for (int i = 0; i < iterations; i++) {
-                    vectorAdd(data, species);
-                }
+                for (int i = 0; i < iterations; i++) vectorAdd(data, species);
                 long elapsedNs = System.nanoTime() - startNs;
                 
-                // 计算带宽 (GB/s)
-                long bytesProcessed = (long) size * 8 * iterations;
+                long bytesProcessed = (long) size * 8L * iterations;
                 double seconds = elapsedNs / 1e9;
                 simdBandwidth = (long) (bytesProcessed / seconds / 1e9);
                 
-                plugin.getLogger().info(String.format(
-                    "[Perf] SIMD Benchmark: %s (%d lanes), Bandwidth: %d GB/s",
-                    species, vectorLanes, simdBandwidth
-                ));
-                
-            } catch (Exception e) {
-                plugin.getLogger().warning("[Perf] SIMD benchmark failed: " + e.getMessage());
+                plugin.getLogger().info(String.format("[Perf] SIMD Active: %s (%d lanes), BW: %d GB/s", 
+                    species, vectorLanes, simdBandwidth));
+            } catch (Throwable e) {
+                plugin.getLogger().warning("[Perf] SIMD unavailable: " + e.getMessage());
             }
         });
     }
@@ -107,120 +128,73 @@ public class PerformanceMonitor {
     private void vectorAdd(double[] data, VectorSpecies<Double> species) {
         int i = 0;
         int bound = species.loopBound(data.length);
-        
         for (; i < bound; i += species.length()) {
-            var v1 = jdk.incubator.vector.DoubleVector.fromArray(species, data, i);
-            var v2 = v1.add(1.0);
-            v2.intoArray(data, i);
+            DoubleVector.fromArray(species, data, i).add(1.0).intoArray(data, i);
         }
     }
     
-    /**
-     * 启动定期监控
-     */
     private void startMonitoring() {
-        int interval = plugin.getConfig().getInt("monitoring.log-interval", 300);
-        
-        scheduler.scheduleAtFixedRate(() -> {
-            try {
-                logPerformanceReport();
-            } catch (Exception e) {
-                plugin.getLogger().warning("[Perf] Monitoring error: " + e.getMessage());
-            }
-        }, interval, interval, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::logPerformanceReport, logInterval, logInterval, TimeUnit.SECONDS);
     }
     
-    /**
-     * 记录性能报告
-     */
     private void logPerformanceReport() {
-        StringBuilder report = new StringBuilder();
-        report.append("\n");
-        report.append("╔════════════════════════════════════════════════════════════╗\n");
-        report.append("║          EcoBridge Performance Report                     ║\n");
-        report.append("╠════════════════════════════════════════════════════════════╣\n");
-        
-        // SIMD 统计
-        long totalCalcs = totalCalculations.sum();
-        long simdCalcs = simdCalculations.sum();
-        double simdRatio = totalCalcs > 0 ? (100.0 * simdCalcs / totalCalcs) : 0.0;
-        
-        report.append(String.format("║ SIMD Vector: %s (%d lanes, %d GB/s)          \n", 
-            getVectorSpeciesName(), vectorLanes, simdBandwidth));
-        report.append(String.format("║ Calculations: %,d total, %,d SIMD (%.1f%%)    \n",
-            totalCalcs, simdCalcs, simdRatio));
-        
-        // 数据库统计
-        report.append(String.format("║ Database: %,d writes, %,d reads              \n",
-            dbWrites.sum(), dbReads.sum()));
-        
-        // 内存统计
-        MemoryUsage heapUsage = memoryBean.getHeapMemoryUsage();
-        long usedMB = heapUsage.getUsed() / 1048576;
-        long maxMB = heapUsage.getMax() / 1048576;
-        double memPercent = 100.0 * heapUsage.getUsed() / heapUsage.getMax();
-        
-        report.append(String.format("║ Memory: %,d MB / %,d MB (%.1f%%)             \n",
-            usedMB, maxMB, memPercent));
-        
-        // GC 统计
-        if (youngGC != null && oldGC != null) {
-            report.append(String.format("║ GC: Young=%,d (%.1fs), Old=%,d (%.1fs)      \n",
-                youngGC.getCollectionCount(), youngGC.getCollectionTime() / 1000.0,
-                oldGC.getCollectionCount(), oldGC.getCollectionTime() / 1000.0));
-        }
-        
-        // 线程统计
-        int threadCount = threadBean.getThreadCount();
-        int peakThreads = threadBean.getPeakThreadCount();
-        report.append(String.format("║ Threads: %d active, %d peak                  \n",
-            threadCount, peakThreads));
-        
-        // TPS 统计
         try {
-            double[] tps = Bukkit.getTPS();
-            report.append(String.format("║ TPS: %.2f (1m), %.2f (5m), %.2f (15m)       \n",
-                tps[0], tps[1], tps[2]));
-        } catch (Exception ignored) {}
-        
-        // 缓存统计
-        if (plugin.getPidController() != null) {
-            int cacheSize = plugin.getPidController().getCacheSize();
-            int dirtySize = plugin.getPidController().getDirtyQueueSize();
-            report.append(String.format("║ PID Cache: %,d items, %,d dirty             \n",
-                cacheSize, dirtySize));
-        }
-        
-        // 性能计数器
-        if (!counters.isEmpty()) {
-            report.append("╠════════════════════════════════════════════════════════════╣\n");
-            report.append("║ Performance Counters:                                      ║\n");
+            StringBuilder report = new StringBuilder();
+            report.append("\n§8[§aEcoBridge§8] §7Performance Diagnostics\n");
             
-            counters.forEach((name, counter) -> {
-                double avgMs = counter.getAverageMs();
-                long count = counter.getCount();
-                report.append(String.format("║  %-30s: %.2fms (×%,d)\n", 
-                    name, avgMs, count));
-            });
-        }
-        
-        report.append("╚════════════════════════════════════════════════════════════╝");
-        
-        plugin.getLogger().info(report.toString());
-    }
-    
-    private String getVectorSpeciesName() {
-        try {
-            var species = jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED;
-            return species.toString().replace("DoubleVector", "");
+            // --- 1. 计算统计 ---
+            long total = totalCalculations.sum();
+            long simd = simdCalculations.sum();
+            double ratio = total > 0 ? (100.0 * simd / total) : 0.0;
+            report.append(String.format(" §7SIMD: §f%d lanes §7| Ratio: §a%.1f%%\n", vectorLanes, ratio));
+            
+            // --- 2. 内存 & 线程 (使用 threadBean) ---
+            MemoryUsage heap = memoryBean.getHeapMemoryUsage();
+            long used = heap.getUsed() / 1048576;
+            long max = heap.getMax() / 1048576;
+            // [Fix] 使用 threadBean 统计线程数
+            report.append(String.format(" §7Mem: §e%dMB/%dMB §7| Threads: §f%d\n", 
+                used, max, threadBean.getThreadCount()));
+            
+            // --- 3. GC 统计 (使用 youngGC/oldGC) ---
+            if (youngGC != null) {
+                report.append(String.format(" §7GC(Young): §f%d runs §7| §e%dms\n", 
+                    youngGC.getCollectionCount(), youngGC.getCollectionTime()));
+            }
+            if (oldGC != null) {
+                report.append(String.format(" §7GC(Old):   §f%d runs §7| §c%dms\n", 
+                    oldGC.getCollectionCount(), oldGC.getCollectionTime()));
+            }
+
+            // --- 4. Server 状态 ---
+            report.append(String.format(" §7TPS: §a%.1f §7| Players: §f%d\n", cachedTps[0], cachedPlayerCount));
+            
+            // --- 5. 数据库 & 热点 ---
+            report.append(String.format(" §7DB IO: §fW:%,d R:%,d\n", dbWrites.sumThenReset(), dbReads.sumThenReset()));
+            
+            if (!counters.isEmpty()) {
+                report.append(" §7Hotspots:\n");
+                counters.forEach((k, v) -> {
+                    if (v.getCount() > 0) {
+                        report.append(String.format("  - %s: §e%.3fms\n", k, v.getAverageMs()));
+                    }
+                });
+            }
+            
+            plugin.getLogger().info(report.toString());
+            
+            // Reset counters
+            totalCalculations.reset();
+            simdCalculations.reset();
+            scalarCalculations.reset();
+            
         } catch (Exception e) {
-            return "Unknown";
+            plugin.getLogger().warning("Error generating perf report: " + e.getMessage());
         }
     }
     
-    /**
-     * 性能计数器
-     */
+    // ==================== 辅助类 ====================
+    
     public static class PerformanceCounter {
         private final AtomicLong totalNs = new AtomicLong(0);
         private final AtomicLong count = new AtomicLong(0);
@@ -235,86 +209,35 @@ public class PerformanceMonitor {
             return c > 0 ? (totalNs.get() / c / 1_000_000.0) : 0.0;
         }
         
-        public long getCount() {
-            return count.get();
-        }
+        public long getCount() { return count.get(); }
     }
     
-    // ==================== 公共接口 ====================
+    // ==================== Public API ====================
     
     public void recordCalculation(boolean usedSIMD) {
         totalCalculations.increment();
-        if (usedSIMD) {
-            simdCalculations.increment();
-        } else {
-            scalarCalculations.increment();
-        }
+        if (usedSIMD) simdCalculations.increment(); else scalarCalculations.increment();
     }
     
-    public void recordDbWrite() {
-        dbWrites.increment();
-    }
-    
-    public void recordDbRead() {
-        dbReads.increment();
-    }
+    public void recordDbWrite() { dbWrites.increment(); }
+    public void recordDbRead() { dbReads.increment(); }
     
     public void startTimer(String name) {
         counters.computeIfAbsent(name, k -> new PerformanceCounter());
     }
     
     public void stopTimer(String name, long startNs) {
-        PerformanceCounter counter = counters.get(name);
-        if (counter != null) {
-            counter.record(System.nanoTime() - startNs);
-        }
-    }
-    
-    /**
-     * 生成诊断报告
-     */
-    public String generateDiagnostics() {
-        StringBuilder sb = new StringBuilder();
-        
-        sb.append("=== EcoBridge Diagnostics ===\n");
-        sb.append("\n[System Info]\n");
-        sb.append("Java: ").append(System.getProperty("java.version")).append("\n");
-        sb.append("OS: ").append(System.getProperty("os.name")).append(" ")
-          .append(System.getProperty("os.version")).append("\n");
-        sb.append("Processors: ").append(Runtime.getRuntime().availableProcessors()).append("\n");
-        
-        sb.append("\n[SIMD Support]\n");
-        sb.append("Vector Species: ").append(getVectorSpeciesName()).append("\n");
-        sb.append("Lanes: ").append(vectorLanes).append("\n");
-        sb.append("Bandwidth: ").append(simdBandwidth).append(" GB/s\n");
-        
-        sb.append("\n[Memory]\n");
-        MemoryUsage heap = memoryBean.getHeapMemoryUsage();
-        sb.append("Heap Used: ").append(heap.getUsed() / 1048576).append(" MB\n");
-        sb.append("Heap Max: ").append(heap.getMax() / 1048576).append(" MB\n");
-        
-        MemoryUsage nonHeap = memoryBean.getNonHeapMemoryUsage();
-        sb.append("Non-Heap Used: ").append(nonHeap.getUsed() / 1048576).append(" MB\n");
-        
-        sb.append("\n[Performance]\n");
-        long totalCalcs = totalCalculations.sum();
-        long simdCalcs = simdCalculations.sum();
-        sb.append("Total Calculations: ").append(totalCalcs).append("\n");
-        sb.append("SIMD Calculations: ").append(simdCalcs).append("\n");
-        sb.append("SIMD Ratio: ").append(String.format("%.2f%%", 
-            totalCalcs > 0 ? 100.0 * simdCalcs / totalCalcs : 0)).append("\n");
-        
-        return sb.toString();
+        PerformanceCounter c = counters.get(name);
+        if (c != null) c.record(System.nanoTime() - startNs);
     }
     
     public void shutdown() {
+        if (syncCacheTask != null && !syncCacheTask.isCancelled()) {
+            syncCacheTask.cancel();
+        }
         scheduler.shutdown();
         try {
-            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                scheduler.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            scheduler.shutdownNow();
-        }
+            if (!scheduler.awaitTermination(2, TimeUnit.SECONDS)) scheduler.shutdownNow();
+        } catch (InterruptedException e) { scheduler.shutdownNow(); }
     }
 }
