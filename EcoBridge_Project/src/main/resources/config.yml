@@ -1,166 +1,151 @@
-# EcoBridge - 生产级配置
-# Java 25 SIMD + FFM + VirtualThreads
+# ==============================================================================
+# EcoBridge - 生产级核心配置文件 (Java 25 SIMD + FFM + VirtualThreads)
+# ==============================================================================
 
-# ==================== 数据库配置 ====================
+# 1. 数据库配置
+# 由 DatabaseManager 调用，支持高性能 HikariCP 线程池
 database:
-  # MariaDB/MySQL 连接 (推荐 MariaDB 10.6+)
+  # 推荐使用 MariaDB 以获得最佳的原子性更新性能
   url: "jdbc:mariadb://localhost:3306/ecobridge?useUnicode=true&characterEncoding=utf8&allowMultiQueries=true&serverTimezone=UTC"
   user: "root"
   password: "your_password_here"
   
-  # HikariCP 连接池
+  # HikariCP 核心连接池参数
   pool:
-    maximum-size: 16          # 最大连接数 (建议 = CPU 核心数)
-    minimum-idle: 4           # 最小空闲连接
-    connection-timeout: 10000 # 连接超时 (ms)
-    idle-timeout: 300000      # 空闲超时 (ms)
-    max-lifetime: 1800000     # 连接最大存活时间 (ms)
+    maximum-size: 16          # 最大连接数 (建议设置为 CPU 物理核心数)
+    minimum-idle: 4           # 最小空闲连接数
+    connection-timeout: 10000 # 获取连接的超时时间 (ms)
+    idle-timeout: 300000      # 连接在池内保持空闲的最大时间 (ms)
+    max-lifetime: 1800000     # 连接物理存活的最大时间 (ms)
 
-# ==================== 经济系统配置 ====================
+# 2. 经济大环境配置
+# 由 MarketManager 调用，对接 CoinsEngine 系统
 economy-settings:
-  # CoinsEngine 货币 ID
-  currency-id: "ellan_gold"
+  currency-id: "ellan_gold"   # 货币内部注册 ID
   
-  # 富人门槛计算
+  # 财富排名与通胀阈值计算
   threshold:
-    min-value: 100000.0       # 最低门槛
-    percentile: 0.15          # 取前 15% 玩家的最低值
+    min-value: 100000.0       # 基础富人门槛，低于此资产不计入宏观影响
+    percentile: 0.15          # 前 15% 的高资产玩家定义当前市场“富人线”
     
-  # 通胀系数
+  # 全局通胀权重
   inflation:
-    weight: 0.3               # 通胀权重 (0-1)
-    update-interval: 36000    # 更新间隔 (ticks, 30分钟)
+    weight: 0.3               # 通胀对物价的影响权重 (0.0-1.0)
 
-# ==================== 个人系数配置 ====================
+# 3. 个人系数配置
+# 针对不同玩家特征的动态调价逻辑
 personal-factor:
-  min-factor: 0.5             # 最低倍率
+  min-factor: 0.5             # 价格保护下限 (最低价格不低于 0.5x)
   
-  # 富人税 (余额超过门槛时增加倍率)
+  # 富人附加费 (基于余额与门槛的对数差距)
   rich:
-    max-tax: 0.1              # 最大税率
-    log-multiplier: 0.01      # 对数系数
+    max-tax: 0.1              # 巨富玩家最高额外加价幅度 (+10%)
+    log-multiplier: 0.01      # 对数增长斜率，控制加价曲线
     
-  # 老玩家折扣
+  # 资深玩家折扣 (基于在线时长)
   veteran:
-    max-discount: 0.05        # 最大折扣
-    threshold-hours: 100      # 资深玩家小时数
+    max-discount: 0.05        # 资深玩家最高优惠 (-5%)
+    threshold-hours: 100      # 达到满级折扣所需的在线小时数
 
-# ==================== 市场波动配置 ====================
+# 4. 市场波动配置
+# 模拟宏观市场情绪抖动
 market-flux:
-  normal-range: 0.05          # 正常波动范围 (±5%)
-  event-range: 0.3            # 事件波动范围 (±30%)
-  event-chance: 0.1           # 事件发生概率 (10%)
-  update-interval: 6000       # 更新间隔 (ticks, 5分钟)
+  normal-range: 0.05          # 日常无事件状态下的波动 (±5%)
+  event-range: 0.3            # 随机市场事件引发的剧烈波动 (±30%)
+  event-chance: 0.1           # 触发大事件的概率 (10%)
 
-# ==================== 活跃度系数 ====================
+# 5. 活跃度系数
+# 基于服务器负载和实时 TPS 的保护补偿机制
 activity:
-  base: 1.0                   # 基础系数
-  player-impact: 0.001        # 每个在线玩家的影响
-  tps-limit: 18.0             # TPS 阈值
-  tps-weight: 0.05            # TPS 惩罚权重
-  update-interval: 1200       # 更新间隔 (ticks, 1分钟)
+  base: 1.0                   # 基础活跃倍率
+  player-impact: 0.001        # 每多一名玩家在线，物价上浮 0.1%
+  tps-limit: 18.0             # 性能红线：TPS 低于此值时视为卡顿
+  tps-weight: 0.05            # TPS 惩罚权重：每降 1 点 TPS 对应的调价幅度
 
-# ==================== 节假日系数 ====================
+# 6. 现实节假日系数
+# 自动抓取法定节假日数据进行价格刺激同步
 holidays:
-  # API 配置
   api-url: "https://api.apihubs.cn/holiday/get"
-  cache-duration: 86400000    # 缓存时间 (ms, 24小时)
+  cache-duration: 86400000    # 本地缓存有效期 (24小时)
   
-  # 倍率配置
+  # 日期类型对应的价格倍率
   multipliers:
     workday: 1.0              # 工作日
     weekend: 1.1              # 周末
-    holiday: 1.5              # 法定节假日
-    compensation: 1.2         # 调休补班
-    other: 0.9                # 其他
+    holiday: 1.5              # 法定节假日 (如春节/国庆)
+    compensation: 1.2         # 调休上班日
+    other: 0.9                # 异常特殊时段
 
-# ==================== PID 控制器配置 ====================
-pid-controller:
-  # SIMD 优化
-  simd-enabled: true
-  vector-species: "PREFERRED" # PREFERRED / MAX / 256 / 512
-  
-  # 并发配置
-  segment-count: 16           # 分段数 (建议 = CPU 核心数)
-  segment-capacity: 8192      # 每段容量
-  
-  # PID 参数
-  target-volume: 1000.0       # 目标交易量
-  base-lambda: 0.002          # 基础价格系数
-  kp: 0.00001                 # 比例系数
-  ki: 0.000001                # 积分系数
-  kd: 0.00005                 # 微分系数
-  kp-neg-factor: 0.6          # 负误差 P 系数衰减
-  tau-inv: 0.00001929         # 积分衰减系数
-  deadband: 0.02              # 死区 (目标的 2%)
-  
-  # 限幅
-  integral-max: 30000.0       # 积分上限
-  integral-min: -30000.0      # 积分下限
-  lambda-max: 0.01            # 价格系数上限
-  lambda-min: 0.0005          # 价格系数下限
-  
-  # 刷新配置
-  flush-interval: 1200        # 刷新间隔 (ticks, 1分钟)
-  batch-size: 1000            # 批量大小
+# ==================== 7. PID 控制器核心配置 ====================
+# 这里的参数由 PidController 动态向量化加载，直接影响 SIMD 引擎的计算结果
+pid:
+  target: 1000.0              # 目标结算量：每个物品在每个周期的期望成交频率
+  deadband: 20.0              # 计算死区：交易变动在此范围内忽略计算
 
-# ==================== 性能优化配置 ====================
+  # PID 增益参数 (Tuning)
+  kp: 0.00001                 # 比例项 (P)：对即时供需失衡的反应强度
+  ki: 0.000001                # 积分项 (I)：消除物价长期偏离目标值的误差
+  kd: 0.00005                 # 微分项 (D)：对交易趋势的预判，压制扫货暴涨
+  kp-negative-multiplier: 0.6 # 下跌系数：让价格跌落比上涨更稳健，防止恐慌抛售
+  
+  # 积分衰减与 EMA 平滑
+  tau: 0.00001929             # 积分衰减率：模拟市场的记忆遗忘速度
+  base: 0.002                 # 基础 Lambda：无交易时的默认衰减率
+  alpha: 0.05                 # 指数平滑权重 (新值占比 5%)
+  beta: 0.95                  # 历史平滑权重 (旧值占比 95%)
+
+  # 强制物理边界 (Clamps)
+  integral-max: 30000.0       # 积分项最大限制
+  integral-min: -30000.0      # 积分项最小限制
+  lambda-max: 0.01            # 物价指数天花板
+  lambda-min: 0.0005          # 物价指数地板
+  dt-max: 1.0                 # 计算步长最大限制 (秒)
+  dt-min: 0.05                # 计算步长最小限制 (秒)
+
+# 8. 性能优化配置
 performance:
-  # VirtualThread 配置
-  virtual-threads: true       # 启用虚拟线程
+  virtual-threads: true       # 启用 Java 25 虚拟线程执行数据库 IO
+  memory-warmup: true         # 启动时预热 FFM 堆外内存，防止首次访问延迟
+  gc-friendly: true           # 启用缓冲池复用，实现 Zero-GC 高频采集
   
-  # 内存优化
-  memory-warmup: true         # 启动时预热内存
-  gc-friendly: true           # GC 友好模式 (复用缓冲)
-  
-  # 调试选项
-  debug-perf: false           # 性能日志
-  debug-db: false             # 数据库日志
-  debug-simd: false           # SIMD 日志
+  # 调试日志
+  debug-perf: false           # 控制台打印每批次 SIMD 计算耗时
+  debug-db: false             # 打印数据库批量刷写的性能统计
+  debug-simd: false           # 打印 SIMD 向量化指令的诊断信息
 
-# ==================== 调度器配置 ====================
+# 9. 任务调度周期 (单位: Ticks, 20 ticks = 1秒)
 schedulers:
-  # 主计算循环 (数据收集 + PID 计算)
   main-loop:
-    initial-delay: 1200       # 初始延迟 (ticks, 1分钟)
-    period: 1200              # 周期 (ticks, 1分钟)
-    
-  # 经济指标更新
+    initial-delay: 1200       # 启动 1 分钟后开启首轮调价
+    period: 1200              # 每 60 秒运行一次全局结算
   economy-update:
-    initial-delay: 100        # 初始延迟 (ticks, 5秒)
-    period: 36000             # 周期 (ticks, 30分钟)
-    
-  # 市场波动更新
+    initial-delay: 100        # 启动 5 秒后加载财富标准
+    period: 36000             # 每 30 分钟同步一次全服排名
   market-flux-update:
-    initial-delay: 20         # 初始延迟 (ticks, 1秒)
-    period: 6000              # 周期 (ticks, 5分钟)
-    
-  # 节假日缓存更新
+    initial-delay: 20
+    period: 6000              # 每 5 分钟刷新一次随机波动
   holiday-update:
-    initial-delay: 20         # 初始延迟 (ticks, 1秒)
-    period: 6000              # 周期 (ticks, 5分钟)
+    initial-delay: 20
+    period: 6000              # 每 5 分钟检查一次节假日
 
-# ==================== 监控配置 ====================
+# 10. 监控与指标配置
 monitoring:
-  enabled: true               # 启用监控
-  log-interval: 300           # 日志间隔 (秒)
+  enabled: true               # 启用性能监控系统
+  log-interval: 300           # 性能报告输出间隔 (秒)
   
-  # 指标收集
   metrics:
-    - pid-calculations        # PID 计算次数
-    - simd-ratio              # SIMD 使用率
-    - cache-hit-rate          # 缓存命中率
-    - db-batch-size           # 数据库批量大小
-    - memory-usage            # 内存使用
-    - tps                     # 服务器 TPS
+    - pid-calculations        # 核心计算次数
+    - simd-ratio              # SIMD 指令占比
+    - cache-hit-rate          # SoA 缓存命中率
+    - db-batch-size           # 数据库批处理大小
+    - memory-usage            # 堆内/堆外内存监控
+    - tps                     # TPS 稳定性监控
 
-# ==================== 兼容性配置 ====================
+# 11. 兼容性与降级
 compatibility:
-  # 插件兼容
-  ultimateshop: true
-  placeholderapi: true
-  coinsengine: true
+  ultimateshop: true          # 挂钩商店数据源
+  placeholderapi: true        # PAPI 变量扩展
+  coinsengine: true           # 货币系统集成核心
   
-  # 降级策略
-  fallback-on-error: true     # 错误时降级到标量计算
-  safe-mode: false            # 安全模式 (禁用所有优化)
+  fallback-on-error: true     # 若 CPU 不支持 SIMD 则自动降级到标量模式
+  safe-mode: false            # 安全模式 (禁用所有异步优化，仅用于排查)
