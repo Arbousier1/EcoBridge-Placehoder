@@ -31,7 +31,7 @@ jobs:
         run: |
           if [ ! -f gradlew ]; then
             echo "Gradlew not found in subdirectory, generating wrapper..."
-            gradle wrapper --gradle-version 8.10.2
+            gradle wrapper --gradle-version 9.3.0
           fi
           chmod +x gradlew
 
