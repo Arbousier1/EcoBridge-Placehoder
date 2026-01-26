@@ -13,8 +13,7 @@ import java.util.logging.Level;
 
 public class DatabaseManager {
 
-    // [新增] 数据传输对象 (DTO): 用于在主线程和数据库IO线程之间传递不可变数据
-    // 使用 Record 减少样板代码，且不可变，线程安全
+    // [DTO] 数据快照，使用 Record 保证不可变性和线程安全
     public record PidDbSnapshot(String itemId, double integral, double lastError, double lastLambda, long updateTime) {}
 
     private final EcoBridge plugin;
@@ -25,11 +24,11 @@ public class DatabaseManager {
     }
 
     public void initPool() {
-        // 在 onEnable 中异步执行，防止卡死主线程
+        // 异步初始化连接池，避免阻塞主线程
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             HikariConfig config = new HikariConfig();
             
-            // 从配置文件读取 (如果未配置则使用默认值)
+            // 读取配置
             String url = plugin.getConfig().getString("database.url", "jdbc:mariadb://localhost:3306/ecobridge");
             String user = plugin.getConfig().getString("database.user", "root");
             String pass = plugin.getConfig().getString("database.password", "password");
@@ -38,20 +37,19 @@ public class DatabaseManager {
             config.setUsername(user);
             config.setPassword(pass);
 
-            // --- HikariCP 极致性能配置 (针对 MySQL/MariaDB) ---
+            // --- HikariCP 针对 MySQL/MariaDB 的高性能配置 ---
             
-            // 1. 开启预处理语句缓存
+            // 1. 预处理语句缓存
             config.addDataSourceProperty("cachePrepStmts", "true");
             config.addDataSourceProperty("prepStmtCacheSize", "250");
             config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
             
-            // 2. 开启服务端预处理 (通常能提升性能)
+            // 2. 服务端预处理
             config.addDataSourceProperty("useServerPrepStmts", "true");
             config.addDataSourceProperty("useLocalSessionState", "true");
             
-            // 3. [关键优化] 开启批量重写 
-            // 将 insert into ... values (...), (...), (...) 合并为单条语句发送
-            // 性能提升可达 10倍+
+            // 3. [关键] 批量重写 (Rewrite Batched Statements)
+            // 将多条 INSERT 语句合并为单条发送，性能提升巨大
             config.addDataSourceProperty("rewriteBatchedStatements", "true");
             
             config.addDataSourceProperty("cacheResultSetMetadata", "true");
@@ -70,7 +68,7 @@ public class DatabaseManager {
                 createTable();
                 plugin.getLogger().info("HikariCP Pool initialized successfully.");
                 
-                // 初始化完成后，加载缓存
+                // 初始化完成后加载数据到内存
                 plugin.getPidController().loadAllStates();
             } catch (Exception e) {
                 plugin.getLogger().severe("Failed to init HikariCP: " + e.getMessage());
@@ -81,6 +79,7 @@ public class DatabaseManager {
     private void createTable() throws SQLException {
         try (Connection conn = dataSource.getConnection();
              Statement stmt = conn.createStatement()) {
+            // 创建表结构
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS eb_pid_states (
                     item_id VARCHAR(64) PRIMARY KEY, 
@@ -95,11 +94,13 @@ public class DatabaseManager {
 
     /**
      * 高性能批量保存
-     * * @param snapshots 不可变的快照列表，线程安全，来自 PidController 的缓冲区
+     * 自动使用事务和 rewriteBatchedStatements 优化写入
+     * @param snapshots 数据快照列表
      */
     public void saveBatch(List<PidDbSnapshot> snapshots) {
         if (snapshots.isEmpty() || dataSource == null || dataSource.isClosed()) return;
 
+        // ON DUPLICATE KEY UPDATE 实现 "存在即更新，不存在即插入"
         String sql = """
             INSERT INTO eb_pid_states (item_id, integral, last_error, last_lambda, update_time) 
             VALUES (?, ?, ?, ?, ?) 
@@ -111,24 +112,25 @@ public class DatabaseManager {
         """;
 
         try (Connection conn = dataSource.getConnection()) {
-            // 关闭自动提交，手动控制事务以获得最大吞吐量
+            // 手动开启事务
             boolean originalAutoCommit = conn.getAutoCommit();
             conn.setAutoCommit(false);
 
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                // 遍历列表 (比遍历 Map.Entry 快)
                 for (PidDbSnapshot record : snapshots) {
                     ps.setString(1, record.itemId());
                     ps.setDouble(2, record.integral());
                     ps.setDouble(3, record.lastError());
                     ps.setDouble(4, record.lastLambda());
                     ps.setLong(5, record.updateTime());
-                    ps.addBatch();
+                    ps.addBatch(); // 添加到批处理队列
                 }
-                ps.executeBatch();
-                conn.commit();
+                
+                ps.executeBatch(); // 执行批量操作
+                conn.commit();     // 提交事务
+                
             } catch (SQLException e) {
-                conn.rollback();
+                conn.rollback();   // 出错回滚
                 throw e; 
             } finally {
                 conn.setAutoCommit(originalAutoCommit);
@@ -139,8 +141,8 @@ public class DatabaseManager {
     }
     
     /**
-     * 加载数据
-     * 使用 Consumer 回调，避免将整个 ResultSet 加载到内存 List 中
+     * 流式加载数据
+     * 使用 Consumer 回调处理每一行，避免一次性加载大量对象占用堆内存
      */
     public void loadStates(java.util.function.Consumer<PidDbSnapshot> consumer) {
         if (dataSource == null || dataSource.isClosed()) return;
@@ -149,7 +151,9 @@ public class DatabaseManager {
              Statement stmt = conn.createStatement();
              java.sql.ResultSet rs = stmt.executeQuery("SELECT * FROM eb_pid_states")) {
              
-            // 流式处理
+            // 设置 fetch size 暗示驱动流式读取，但这取决于驱动实现
+            stmt.setFetchSize(1000); 
+
             while (rs.next()) {
                 consumer.accept(new PidDbSnapshot(
                     rs.getString("item_id"),

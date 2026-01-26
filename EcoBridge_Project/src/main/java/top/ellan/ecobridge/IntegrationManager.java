@@ -11,11 +11,11 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class IntegrationManager {
-    // 缓存元数据记录
+    // 缓存元数据记录，减少字符串解析开销
     public record ItemMeta(String shopId, String productId) {}
 
     private final EcoBridge plugin;
-    // 解析缓存：rawId -> Meta
+    // 解析缓存：rawId -> Meta (如 "market_diamond" -> {"market", "diamond"})
     private final ConcurrentHashMap<String, ItemMeta> idParserCache = new ConcurrentHashMap<>();
     // 监控列表 (线程安全)
     private final List<String> monitoredItems = Collections.synchronizedList(new ArrayList<>());
@@ -45,6 +45,7 @@ public class IntegrationManager {
         double[] volumes = new double[monitoredItems.size()];
         int idx = 0;
 
+        // 遍历所有监控物品，采集实时销量
         for (String rawId : monitoredItems) {
             ItemMeta meta = idParserCache.get(rawId);
             if (meta == null) continue;
@@ -55,6 +56,7 @@ public class IntegrationManager {
                 
                 if (item != null) {
                     // 2. 获取全服交易次数缓存 (买入次数 - 卖出次数 = 净销量)
+                    // 这里的开销极低，因为 UltimateShop 内部已经做了缓存
                     ObjectUseTimesCache cache = ShopHelper.getServerUseTimesCache(item);
                     
                     double netVolume = 0.0;
@@ -133,5 +135,15 @@ public class IntegrationManager {
         }
         
         plugin.getLogger().info("Synced " + monitoredItems.size() + " items from UltimateShop for SIMD processing.");
+    }
+    
+    /**
+     * 获取所有受监控的物品 ID 列表
+     * 用于指令 Tab 补全
+     * @return 物品 ID 列表的副本
+     */
+    public List<String> getMonitoredItems() {
+        // 返回副本以保证线程安全，防止在遍历时被修改
+        return new ArrayList<>(monitoredItems); 
     }
 }

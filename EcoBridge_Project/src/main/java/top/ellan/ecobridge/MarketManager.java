@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.bukkit.Bukkit;
 import org.bukkit.OfflinePlayer;
+import org.bukkit.Statistic; // [修复] 正确的 Bukkit 统计枚举导入
+import org.bukkit.entity.Player;
 import su.nightexpress.coinsengine.api.CoinsEngineAPI;
 import su.nightexpress.coinsengine.api.currency.Currency;
 
@@ -11,6 +13,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.util.*;
@@ -20,10 +23,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class MarketManager {
+
     private final EcoBridge plugin;
     
     // [优化] 使用 Java 21+ 虚拟线程执行器处理 IO 密集型任务
-    // 相比 Bukkit 的 runTaskAsynchronously (使用平台线程)，虚拟线程在处理 HTTP/SQL 等待时几乎零开销
     private final ExecutorService virtualExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
     // 核心数据 (线程安全引用)
@@ -34,8 +37,11 @@ public class MarketManager {
     
     // 节假日缓存
     private final ConcurrentHashMap<String, Integer> holidayCache = new ConcurrentHashMap<>();
+    private long lastHolidayUpdate = 0;
+    
     private final HttpClient httpClient;
     private final ObjectMapper jsonMapper;
+    private Currency currency;
 
     // 配置常量
     private static final double MIN_THRESH = 100000.0;
@@ -53,6 +59,88 @@ public class MarketManager {
                 .executor(virtualExecutor) // 让 HttpClient 内部也使用虚拟线程
                 .build();
         this.jsonMapper = new ObjectMapper();
+        
+        setupCurrency();
+    }
+    
+    private void setupCurrency() {
+        if (Bukkit.getPluginManager().getPlugin("CoinsEngine") != null) {
+            String currencyId = plugin.getConfig().getString("economy-settings.currency-id", "ellan_gold");
+            this.currency = CoinsEngineAPI.getCurrency(currencyId);
+            if (this.currency == null) {
+                plugin.getLogger().warning("Currency '" + currencyId + "' not found in CoinsEngine!");
+            }
+        }
+    }
+
+    // =========================================================================
+    // 核心计算逻辑 (线程安全增强版)
+    // =========================================================================
+
+    /**
+     * 计算玩家的个人价格系数 (富人税 + 老玩家福利)
+     * [安全] 可在任何线程调用，内部会自动处理 Bukkit API 的线程约束
+     */
+    public double calculatePersonalFactor(Player player) {
+        if (player.isOp()) return 1.0;
+        
+        // 1. 获取配置
+        double minFactor = plugin.getConfig().getDouble("personal-factor.min-factor", 0.5);
+        double maxTax = plugin.getConfig().getDouble("personal-factor.rich.max-tax", 0.1);
+        double richCap = maxTax * 2;
+        double richMult = maxTax / 10.0; 
+        
+        double currentFactor = 1.0;
+        
+        // 2. 富人税计算 (使用 Log10 抑制巨额财富)
+        if (currency != null) {
+            // CoinsEngine 内部处理了数据库连接，通常可以直接调用
+            double balance = CoinsEngineAPI.getBalance(player.getUniqueId(), currency);
+            double threshold = currentThreshold.get();
+            
+            if (balance > threshold) {
+                double excess = balance - threshold;
+                // Java Math.log10 = 以10为底的对数
+                double tax = Math.log10(excess + 10) * richMult;
+                currentFactor += Math.min(tax, richCap);
+            }
+        }
+        
+        // 3. 老玩家福利 (PlayTime 统计)
+        // [修复] 使用 getSafeStatistic 替代直接调用，防止异步访问 Bukkit API 报错
+        int ticksPlayed = getSafeStatistic(player, Statistic.PLAY_ONE_MINUTE);
+        
+        if (ticksPlayed > 0) {
+            double vetMax = plugin.getConfig().getDouble("personal-factor.veteran.max-discount", 0.05);
+            int vetHours = plugin.getConfig().getInt("personal-factor.veteran.threshold-hours", 100);
+            long targetTicks = vetHours * 72000L; // 1 hour = 3600s = 72000 ticks
+            
+            // 线性插值计算折扣
+            double discount = (double) ticksPlayed / targetTicks * vetMax;
+            currentFactor -= Math.min(discount, vetMax);
+        }
+        
+        return Math.max(minFactor, currentFactor);
+    }
+
+    /**
+     * [关键辅助方法] 线程安全的统计数据读取器
+     * 如果当前是主线程：直接读取
+     * 如果当前是虚拟/异步线程：调度到主线程并阻塞等待结果 (利用虚拟线程特性，零性能损耗)
+     */
+    private int getSafeStatistic(Player player, Statistic statistic) {
+        if (Bukkit.isPrimaryThread()) {
+            return player.getStatistic(statistic);
+        } else {
+            try {
+                // callSyncMethod 返回 Future，.get() 会阻塞当前虚拟线程直到主线程执行完毕
+                // 对于虚拟线程来说，这种阻塞仅仅是挂起（Unmount），不会占用操作系统线程
+                return Bukkit.getScheduler().callSyncMethod(plugin, () -> player.getStatistic(statistic)).get();
+            } catch (Exception e) {
+                // 如果玩家下线或任务取消，返回 0 避免影响计算
+                return 0;
+            }
+        }
     }
 
     /**
@@ -60,34 +148,21 @@ public class MarketManager {
      * [优化] 使用虚拟线程运行，防止大量数据库查询阻塞服务器通用线程池
      */
     public void updateEconomyMetrics() {
-        if (!Bukkit.getPluginManager().isPluginEnabled("CoinsEngine")) return;
+        if (currency == null) return;
         
         virtualExecutor.submit(() -> {
             try {
-                // 1. 获取配置与货币
-                // 注意：config读取通常不耗时，但建议在主线程预加载。这里为了逻辑完整保留读取。
-                String currencyId = plugin.getConfig().getString("economy-settings.currency-id", "ellan_gold");
-                Currency currency = CoinsEngineAPI.getCurrency(currencyId);
-                
-                if (currency == null) {
-                    plugin.getLogger().warning("Currency '" + currencyId + "' not found in CoinsEngine!");
-                    return;
-                }
-
-                // 2. 获取玩家列表 (注意：getOfflinePlayers 可能会返回大量数据)
-                // Bukkit API 的 getOfflinePlayers 返回的是数组拷贝，线程安全，但可能较慢
+                // getOfflinePlayers 返回的是快照数组，在异步线程遍历是安全的
                 OfflinePlayer[] allPlayers = Bukkit.getOfflinePlayers();
                 
                 // [优化] 使用 ArrayList 预估容量，减少扩容开销
-                List<Double> balances = new ArrayList<>(Math.min(allPlayers.length, 10000));
+                List<Double> balances = new ArrayList<>(Math.min(allPlayers.length, 5000));
 
                 for (OfflinePlayer p : allPlayers) {
-                    if (p.isOp()) continue; // 排除管理员
+                    if (p.isOp()) continue; 
                     
-                    // [修复] getBalance 必须传入 UUID
-                    // CoinsEngine 的 getBalance 可能会触发数据库查询，这正是虚拟线程发挥作用的地方
+                    // CoinsEngineAPI 可能触发数据库 IO
                     double bal = CoinsEngineAPI.getBalance(p.getUniqueId(), currency);
-                    
                     if (bal > 0) {
                         balances.add(bal);
                     }
@@ -96,7 +171,6 @@ public class MarketManager {
                 if (balances.isEmpty()) return;
 
                 // 3. 计算统计数据 (排序 + 分位数)
-                // 对于基本类型 Double，Java 的 TimSort 已经非常高效
                 Collections.sort(balances);
                 
                 int size = balances.size();
@@ -124,27 +198,29 @@ public class MarketManager {
 
     /**
      * 更新市场波动值 (Market Flux)
-     * 逻辑：确定性随机 (基于小时种子)
      */
     public void updateMarketFlux() {
-        // 纯计算任务，无需虚拟线程，直接在调用线程执行即可
+        // 纯计算任务
         long currentHour = System.currentTimeMillis() / 3600000L; 
         Random rng = new Random(currentHour); 
 
-        double range = 0.05; 
-        if (rng.nextDouble() < 0.1) {
-            range = 0.3; 
+        double range = plugin.getConfig().getDouble("market-flux.normal-range", 0.05);
+        if (rng.nextDouble() < plugin.getConfig().getDouble("market-flux.event-chance", 0.1)) {
+            range = plugin.getConfig().getDouble("market-flux.event-range", 0.3); 
         }
 
         double rawFlux = 1.0 + ((rng.nextDouble() * 2.0 - 1.0) * range);
         double finalFlux = rawFlux * inflation.get();
+        
+        // 保留3位小数
+        finalFlux = Math.floor(finalFlux * 1000) / 1000.0;
         
         marketFlux.set(finalFlux);
     }
 
     /**
      * 更新活跃度因子 (TPS & 在线人数)
-     * [注意] 必须在主线程 (Sync) 运行，因为 Bukkit.getTPS() 和 getOnlinePlayers() 非线程安全
+     * [注意] 必须在主线程 (Sync) 运行
      */
     public void updateActivityFactor() {
         Bukkit.getScheduler().runTask(plugin, () -> {
@@ -157,15 +233,17 @@ public class MarketManager {
                 if (tpsArr != null && tpsArr.length > 0) {
                     tps = tpsArr[0];
                 }
-            } catch (Throwable ignored) {
-                // 兼容性兜底 (某些非 Paper 服务端可能没有 getTPS)
-            }
+            } catch (Throwable ignored) {}
 
-            double factor = 1.0 + (online * 0.001); 
+            double base = plugin.getConfig().getDouble("activity.base", 1.0);
+            double impact = plugin.getConfig().getDouble("activity.player-impact", 0.001);
             
-            if (tps < 18.0) {
-                // TPS 越低，价格越高 (抑制交易)
-                factor += (20.0 - tps) * 0.05;
+            double factor = base + (online * impact); 
+            
+            double tpsLimit = plugin.getConfig().getDouble("activity.tps-limit", 18.0);
+            if (tps < tpsLimit) {
+                double weight = plugin.getConfig().getDouble("activity.tps-weight", 0.05);
+                factor += (20.0 - Math.max(5.0, tps)) * weight;
             }
             activityFactor.set(factor);
         });
@@ -173,19 +251,20 @@ public class MarketManager {
 
     /**
      * 更新节假日缓存 (HTTP 请求)
-     * [优化] 使用 HttpClient 异步 API + 虚拟线程回调
      */
     public void updateHolidayCache() {
+        if (System.currentTimeMillis() - lastHolidayUpdate < 86400000) return; // 24h CD
+
         int year = LocalDate.now().getYear();
         String url = HOLIDAY_API_URL + "?year=" + year;
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
-                .header("User-Agent", "EcoBridge-JavaClient/1.0")
+                .header("User-Agent", "EcoBridge/Java25")
                 .GET()
                 .build();
 
-        // 异步发送请求，Future 回调也会在 Executor (虚拟线程) 中执行
+        // 异步发送请求
         httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
                 .thenApply(HttpResponse::body)
                 .thenAccept(body -> {
@@ -200,6 +279,7 @@ public class MarketManager {
                                     int type = node.get("type").asInt();
                                     holidayCache.put(date, type);
                                 }
+                                lastHolidayUpdate = System.currentTimeMillis();
                                 plugin.getLogger().info("Holiday cache updated via VirtualThread (" + year + ")");
                             }
                         }
@@ -215,31 +295,31 @@ public class MarketManager {
 
     public double getHolidayFactor() {
         LocalDate today = LocalDate.now();
-        String dateKey = String.format("%d-%d-%d", today.getYear(), today.getMonthValue(), today.getDayOfMonth());
+        String dateKey = today.toString(); // yyyy-MM-dd
 
         if (holidayCache.containsKey(dateKey)) {
             int type = holidayCache.get(dateKey);
             return switch (type) {
-                case 0 -> 1.0; 
-                case 1 -> 1.1; 
-                case 2 -> 1.5; 
-                case 3 -> 1.2; 
-                default -> 1.0;
+                case 0 -> plugin.getConfig().getDouble("holidays.multipliers.workday", 1.0);
+                case 1 -> plugin.getConfig().getDouble("holidays.multipliers.weekend", 1.1);
+                case 2 -> plugin.getConfig().getDouble("holidays.multipliers.holiday", 1.5);
+                case 3 -> plugin.getConfig().getDouble("holidays.multipliers.compensation", 1.2);
+                default -> plugin.getConfig().getDouble("holidays.multipliers.other", 0.9);
             };
         }
 
-        int dayOfWeek = today.getDayOfWeek().getValue(); 
-        if (dayOfWeek == 6 || dayOfWeek == 7) {
-            return 1.1;
+        DayOfWeek day = today.getDayOfWeek();
+        if (day == DayOfWeek.SATURDAY || day == DayOfWeek.SUNDAY) {
+            return plugin.getConfig().getDouble("holidays.multipliers.weekend", 1.1);
         }
 
-        return 1.0;
+        return plugin.getConfig().getDouble("holidays.multipliers.workday", 1.0);
     }
 
-    // 关闭线程池 (在插件 disable 时调用)
+    // 关闭线程池
     public void shutdown() {
         if (!virtualExecutor.isShutdown()) {
-            virtualExecutor.shutdown();
+            virtualExecutor.shutdownNow();
         }
     }
 

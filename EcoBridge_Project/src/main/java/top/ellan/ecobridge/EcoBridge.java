@@ -1,8 +1,8 @@
-package top.ellan.ecobridge; // [确认] 包名与 Gradle 配置保持一致
+package top.ellan.ecobridge;
 
+import org.bukkit.Bukkit;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitRunnable;
-import org.bukkit.Bukkit;
 
 public class EcoBridge extends JavaPlugin {
 
@@ -23,12 +23,13 @@ public class EcoBridge extends JavaPlugin {
         this.pidController = new PidController(this);
         // MarketManager 会启动虚拟线程 Executor
         this.marketManager = new MarketManager(this);
+        // IntegrationManager 初始化
         this.integrationManager = new IntegrationManager(this);
 
         // 2. 异步初始化数据库连接池 (防止卡顿主线程)
         databaseManager.initPool();
 
-        // 3. 注册 PlaceholderAPI
+        // 3. 注册 PlaceholderAPI (变量支持)
         if (Bukkit.getPluginManager().getPlugin("PlaceholderAPI") != null) {
             new EcoBridgeExpansion(this).register();
             getLogger().info("PlaceholderAPI hook registered.");
@@ -36,7 +37,15 @@ public class EcoBridge extends JavaPlugin {
             getLogger().warning("PlaceholderAPI not found! Variables will not work.");
         }
 
-        // 4. 启动定时任务
+        // [新增] 4. 注册指令 (核心功能补全)
+        if (getCommand("ecobridge") != null) {
+            getCommand("ecobridge").setExecutor(new EcoBridgeCommand(this));
+            getLogger().info("Commands registered.");
+        } else {
+            getLogger().severe("Failed to register command 'ecobridge'. Is it defined in plugin.yml?");
+        }
+
+        // 5. 启动定时任务
         startSchedulers();
 
         getLogger().info("EcoBridge (Java 25 SIMD + FFM + VirtualThreads) loaded successfully.");
@@ -51,13 +60,13 @@ public class EcoBridge extends JavaPlugin {
             getLogger().info("Flushing PID buffer...");
             pidController.flushBuffer(true); // 同步刷写剩余数据到数据库
             
-            // [新增] 必须关闭 FFM Arena 以释放堆外内存
+            // [关键] 关闭 FFM Arena 以释放堆外内存，防止内存泄漏
             pidController.close(); 
         }
 
         // 2. 处理市场管理器资源
         if (marketManager != null) {
-            // [新增] 关闭虚拟线程池和 HttpClient
+            // [关键] 关闭虚拟线程池和 HttpClient
             marketManager.shutdown();
         }
 
