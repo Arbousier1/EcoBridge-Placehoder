@@ -1,0 +1,51 @@
+name: Build and Upload EcoBridge
+
+on:
+  push:
+    branches: [ "master", "main" ] # 当推送到这些分支时触发
+  pull_request:
+    branches: [ "master", "main" ]
+  workflow_dispatch: # 允许手动触发构建
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 必须获取全部历史以生成正确的 Git Hash 版本号
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'oracle' # 目前 Oracle 提供较稳定的 Java 25 早期访问/正式版
+          cache: 'gradle'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        # 使用 shadowJar 任务打包全量依赖包
+        run: ./gradlew shadowJar --no-daemon
+
+      - name: Get Project Info
+        id: info
+        run: |
+          # 提取生成的文件名和版本，方便后续步骤使用
+          JAR_PATH=$(find build/libs -name "*.jar" | head -n 1)
+          JAR_NAME=$(basename $JAR_PATH)
+          echo "jar_path=$JAR_PATH" >> $GITHUB_OUTPUT
+          echo "jar_name=$JAR_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EcoBridge-Build-${{ github.sha }}
+          path: ${{ steps.info.outputs.jar_path }}
+          if-no-files-found: error
+          retention-days: 7 # 构建产物保留 7 天
