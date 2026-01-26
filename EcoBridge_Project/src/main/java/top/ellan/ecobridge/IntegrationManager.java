@@ -8,17 +8,28 @@ import cn.superiormc.ultimateshop.objects.caches.ObjectUseTimesCache;
 import org.bukkit.Bukkit;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * 集成管理器 - 负责与 UltimateShop 数据对接
+ * 优化重点：高性能对象化索引、规避 API 查找损耗、线程安全读取
+ */
 public class IntegrationManager {
-    // 缓存元数据记录，减少字符串解析开销
-    public record ItemMeta(String shopId, String productId) {}
+
+    /**
+     * 内部条目：缓存所有高频读取的元数据 [cite: 71, 80]
+     */
+    private record ItemEntry(
+            String rawId,       // PID 控制器唯一识别码 (shopId_productId)
+            ObjectItem item     // 持有 UltimateShop 商品对象引用，规避重复查找 [cite: 72]
+    ) {}
 
     private final EcoBridge plugin;
-    // 解析缓存：rawId -> Meta (如 "market_diamond" -> {"market", "diamond"})
-    private final ConcurrentHashMap<String, ItemMeta> idParserCache = new ConcurrentHashMap<>();
-    // 监控列表 (线程安全)
-    private final List<String> monitoredItems = Collections.synchronizedList(new ArrayList<>());
+    
+    // 活动条目列表：采集循环的核心数据源
+    private List<ItemEntry> activeEntries = new ArrayList<>();
+    
+    // 指令补全专用缓存：使用 volatile 保证异步读取的可见性 [cite: 58, 69]
+    private volatile List<String> monitoredIdCache = Collections.emptyList();
 
     public IntegrationManager(EcoBridge plugin) {
         this.plugin = plugin;
@@ -26,124 +37,105 @@ public class IntegrationManager {
 
     /**
      * 数据采集核心逻辑
-     * 必须在 主线程 (Sync) 运行，因为 UltimateShop API 读取非线程安全
+     * 运行在主线程 (Sync)，提取销量数据并投递至异步 SIMD 引擎 [cite: 27, 76]
      */
     public void collectDataAndCalculate() {
-        // 如果列表为空，尝试同步一次商店配置
-        if (monitoredItems.isEmpty()) {
+        // 若监控列表为空，尝试自动同步一次
+        if (activeEntries.isEmpty()) {
             syncShops();
+            if (activeEntries.isEmpty()) return;
         }
 
-        if (monitoredItems.isEmpty()) return;
+        // 使用局部变量引用，确保单次循环的数据一致性
+        final List<ItemEntry> currentItems = this.activeEntries;
+        final int size = currentItems.size();
 
-        // --- SIMD 批量数据准备 ---
-        // 使用 ArrayList 保证顺序，方便 SIMD 转换
-        List<String> activeIds = new ArrayList<>(monitoredItems.size());
-        
-        // 原始数组用于 SIMD 计算，预分配大小
-        // double[] 的内存布局是连续的，非常适合 Vector API 加载
-        double[] volumes = new double[monitoredItems.size()];
-        int idx = 0;
+        // 预分配容器，存储待计算的 ID 和 净销量 [cite: 71]
+        List<String> ids = new ArrayList<>(size);
+        double[] volumes = new double[size];
+        int count = 0;
 
-        // 遍历所有监控物品，采集实时销量
-        for (String rawId : monitoredItems) {
-            ItemMeta meta = idParserCache.get(rawId);
-            if (meta == null) continue;
-
+        // --- 极速采集循环 ---
+        for (int i = 0; i < size; i++) {
+            ItemEntry entry = currentItems.get(i);
+            
             try {
-                // 1. 通过 ShopID 和 ProductID 获取商品对象
-                ObjectItem item = ShopHelper.getItemFromID(meta.shopId(), meta.productId());
+                // 直接通过持有对象获取全服交易次数 [cite: 72, 73]
+                ObjectUseTimesCache cache = ShopHelper.getServerUseTimesCache(entry.item());
                 
-                if (item != null) {
-                    // 2. 获取全服交易次数缓存 (买入次数 - 卖出次数 = 净销量)
-                    // 这里的开销极低，因为 UltimateShop 内部已经做了缓存
-                    ObjectUseTimesCache cache = ShopHelper.getServerUseTimesCache(item);
+                if (cache != null) {
+                    // 净销量 = 买入 - 卖出 [cite: 74]
+                    double netVolume = cache.getBuyUseTimes() - cache.getSellUseTimes();
                     
-                    double netVolume = 0.0;
-                    if (cache != null) {
-                        double buy = cache.getBuyUseTimes();
-                        double sell = cache.getSellUseTimes();
-                        netVolume = buy - sell;
-                    }
-                    
-                    // 将有效数据加入批量容器
-                    activeIds.add(rawId);
-                    volumes[idx++] = netVolume;
+                    ids.add(entry.rawId());
+                    volumes[count++] = netVolume;
                 }
-            } catch (Exception e) {
-                // 容错处理 (生产环境可降低日志级别)
-                // plugin.getLogger().warning("Error collecting data for " + rawId + ": " + e.getMessage());
+            } catch (Exception ignored) {
+                // 静默处理单个商品采集错误，维持整体运行
             }
         }
 
-        // 如果没有有效数据，直接返回
-        if (idx == 0) return;
+        if (count == 0) return;
 
-        // 截断数组 (如果有无效物品导致 idx < size)
-        final int finalCount = idx;
-        final List<String> finalIds = activeIds;
-        final double[] finalVolumes = Arrays.copyOf(volumes, finalCount); 
+        // 精准截断数据，确保传给 PID 控制器的数组没有空尾部 [cite: 75]
+        final List<String> finalIds = ids;
+        final double[] finalVolumes = (count == size) ? volumes : Arrays.copyOf(volumes, count);
 
-        // 3. 提交批量任务到异步线程池进行 SIMD 计算
-        // 虽然 Vector API 极快，但依然建议移出主线程以防万一
+        // 异步执行 SIMD 向量化计算，释放主线程 [cite: 76, 130]
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             plugin.getPidController().calculateBatch(finalIds, finalVolumes);
         });
     }
 
     /**
-     * 同步商店列表
-     * 遍历 UltimateShop 的配置，将所有商品加入监控列表
+     * 同步商店与商品列表
+     * 遍历 UltimateShop 配置，构建 EcoBridge 内部高效索引 [cite: 77-80]
      */
-    public void syncShops() {
-        // 确保 ConfigManager 已加载
+    public synchronized void syncShops() {
         if (ConfigManager.configManager == null || ConfigManager.configManager.shopConfigs == null) {
-            plugin.getLogger().warning("UltimateShop ConfigManager not initialized yet.");
+            plugin.getLogger().warning("UltimateShop 核心尚未加载完毕，同步延迟。 [cite: 76]");
             return;
         }
 
-        // 获取所有商店配置 Map<ShopID, ObjectShop>
         Map<String, ObjectShop> shopMap = ConfigManager.configManager.shopConfigs;
-        
         if (shopMap.isEmpty()) return;
 
-        monitoredItems.clear();
-        idParserCache.clear();
+        // 预估容量：商店数 * 平均 10 个物品 [cite: 78, 79]
+        List<ItemEntry> newEntries = new ArrayList<>(shopMap.size() * 10);
+        List<String> newIds = new ArrayList<>(shopMap.size() * 10);
 
         for (Map.Entry<String, ObjectShop> entry : shopMap.entrySet()) {
             String shopId = entry.getKey();
             ObjectShop shop = entry.getValue();
-            
             if (shop == null) continue;
 
-            // 获取该商店内的所有商品
             List<ObjectItem> productList = shop.getProductList();
             if (productList == null) continue;
 
             for (ObjectItem item : productList) {
-                String productId = item.getProduct(); // 获取商品ID
-                
+                String productId = item.getProduct(); // 获取配置键名 [cite: 79]
                 if (productId == null || productId.isEmpty()) continue;
 
-                // 生成唯一标识符 rawId (格式: shopId_productId)
+                // 提前拼接唯一识别码，避免运行时计算 [cite: 80]
                 String rawId = shopId + "_" + productId;
-
-                // 存入解析缓存，供采集时快速查找
-                idParserCache.put(rawId, new ItemMeta(shopId, productId));
-                monitoredItems.add(rawId);
+                
+                newEntries.add(new ItemEntry(rawId, item));
+                newIds.add(rawId);
             }
         }
-        
-        plugin.getLogger().info("Synced " + monitoredItems.size() + " items from UltimateShop for SIMD processing.");
+
+        // 原子替换引用，旧列表交由 GC 处理 
+        this.activeEntries = newEntries;
+        this.monitoredIdCache = Collections.unmodifiableList(newIds);
+
+        plugin.getLogger().info("成功同步 " + activeEntries.size() + " 个监控物品。 ");
     }
-    
+
     /**
-     * 获取所有受监控的物品 ID 列表
-     * 用于指令 Tab 补全
-     * @return 物品 ID 列表的副本
+     * 获取受监控 ID 缓存
+     * 用于 EcoBridgeCommand 的 TabCompletion 零延迟补全 [cite: 57, 58]
      */
     public List<String> getMonitoredItems() {
-        // 返回副本以保证线程安全，防止在遍历时被修改
-        return new ArrayList<>(monitoredItems); 
+        return monitoredIdCache;
     }
 }
