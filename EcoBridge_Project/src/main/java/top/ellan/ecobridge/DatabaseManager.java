@@ -29,7 +29,7 @@ public class DatabaseManager {
     private HikariDataSource dataSource;
     
     // 批量操作队列
-    private final BlockingQueue<PidDbSnapshot> pendingWrites = new LinkedBlockingQueue<>(10000);
+    private final BlockingQueue<PidDbSnapshot> pendingWrites = new LinkedBlockingQueue<>(20000);
     private final ScheduledExecutorService batchScheduler = Executors.newSingleThreadScheduledExecutor(
         Thread.ofVirtual().factory()
     );
@@ -163,16 +163,19 @@ public class DatabaseManager {
      * 批量保存 (公共接口)
      */
     public void saveBatch(List<PidDbSnapshot> snapshots) {
-        if (!initialized || snapshots.isEmpty()) return;
+        if (!initialized || snapshots.isEmpty()) return; // 
         
-        // 小批量直接入队
-        if (snapshots.size() <= 100) {
-            pendingWrites.addAll(snapshots);
+        // 1. 阈值判定：如果数据量较大（例如超过 1000 条）
+        // 这种情况下合并写入的收益降低，且一次性往队列塞入过量数据可能导致阻塞
+        if (snapshots.size() > 1000) {
+            // 直接开启虚拟线程绕过队列进行物理写入 
+            Thread.ofVirtual().start(() -> executeBatchWrite(snapshots));
             return;
         }
         
-        // 大批量直接写入
-        Thread.ofVirtual().start(() -> executeBatchWrite(snapshots));
+        // 2. 小规模增量数据（如每分钟的常规调价）
+        // 将数据快速存入阻塞队列，由内部调度器每 500ms 自动合并写入，极大减少数据库连接开销 [cite: 13, 14]
+        pendingWrites.addAll(snapshots);
     }
     
     /**
@@ -298,26 +301,44 @@ public class DatabaseManager {
     }
     
     /**
-     * 关闭连接池
+     * 强化版关闭逻辑：确保队列中所有调价数据完全落盘
      */
     public void closePool() {
-        // 先刷新待写队列
-        flushPendingWrites();
+        plugin.getLogger().info("[DB] 正在执行优雅停机，清理待写入队列...");
         
-        // 关闭调度器
+        // 1. 首先关闭调度器，停止定时任务
         batchScheduler.shutdown();
+        
         try {
+            // 2. 循环排空队列：直到 pendingWrites 彻底为空
+            // 之前的版本只刷一次，现在我们循环直到所有数据都进入 executeBatchWrite
+            int totalFlushed = 0;
+            while (!pendingWrites.isEmpty()) {
+                List<PidDbSnapshot> finalBatch = new ArrayList<>(2000);
+                pendingWrites.drainTo(finalBatch, 2000);
+                if (!finalBatch.isEmpty()) {
+                    // 注意：这里必须同步执行写入，不能再开虚拟线程，否则主线程关了连接池，异步线程会报错
+                    executeBatchWrite(finalBatch);
+                    totalFlushed += finalBatch.size();
+                }
+            }
+            if (totalFlushed > 0) {
+                plugin.getLogger().info("[DB] 停机前成功追加写入 " + totalFlushed + " 条记录");
+            }
+
+            // 3. 等待调度器任务彻底结束
             if (!batchScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
                 batchScheduler.shutdownNow();
             }
         } catch (InterruptedException e) {
             batchScheduler.shutdownNow();
+            Thread.currentThread().interrupt();
         }
         
-        // 关闭连接池
+        // 4. 最后关闭连接池
         if (dataSource != null && !dataSource.isClosed()) {
             dataSource.close();
-            plugin.getLogger().info("[DB] Connection pool closed");
+            plugin.getLogger().info("[DB] HikariCP 连接池已安全关闭");
         }
     }
     
@@ -327,5 +348,9 @@ public class DatabaseManager {
     
     public boolean isInitialized() {
         return initialized;
+    }
+
+    public int getPendingWritesCount() {
+    return pendingWrites.size();
     }
 }

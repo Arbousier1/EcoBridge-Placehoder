@@ -9,21 +9,22 @@ import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
-
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Random;
 import java.util.stream.Collectors;
 
 /**
  * EcoBridgeCommand - 极限优化版指令处理器
- * * 已修复:
- * 1. 适配 OptimizedPidController 的 handle/inspect 逻辑
- * 2. 完善了 SIMD 诊断与性能报告生成逻辑
- * 3. 增强了 MiniMessage 视觉反馈
+ *
+ * 已修复 & 增强:
+ * 1. handleReload 中新增 pidController.reloadConfig() 支持 PID 参数热重载
+ * 2. handleBenchmark 实现真实 5,000,000 次 PID 迭代压力测试（异步执行 + 报告结果）
+ * 3. 完善 SIMD 诊断与性能报告
+ * 4. 增强 MiniMessage 视觉反馈与错误处理
  */
 public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
-
     private final EcoBridge plugin;
     private final MiniMessage mm = MiniMessage.miniMessage();
 
@@ -36,20 +37,17 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
     }
 
     @Override
-    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, 
-                           @NotNull String label, @NotNull String[] args) {
+    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command,
+                             @NotNull String label, @NotNull String[] args) {
         if (!sender.hasPermission("ecobridge.admin")) {
             msg(sender, "<red>❌ 你没有权限执行此操作。");
             return true;
         }
-
         if (args.length == 0 || args[0].equalsIgnoreCase("help")) {
             sendHelp(sender);
             return true;
         }
-
         String sub = args[0].toLowerCase();
-
         switch (sub) {
             case "reload" -> handleReload(sender);
             case "check" -> handleCheck(sender, args);
@@ -66,11 +64,11 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
 
     private void sendHelp(CommandSender sender) {
         msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        msg(sender, "<gradient:gold:yellow><bold>EcoBridge</gradient> <dark_gray>» <gray>v" + 
-            plugin.getPluginMeta().getVersion());
+        msg(sender, "<gradient:gold:yellow><bold>EcoBridge</gradient> <dark_gray>» <gray>v" +
+                plugin.getPluginMeta().getVersion());
         msg(sender, "");
         msg(sender, " <yellow>基础维护:");
-        msg(sender, "  <gold>/eb reload <dark_gray>• <gray>热重载配置、商店与市场缓存 ");
+        msg(sender, "  <gold>/eb reload <dark_gray>• <gray>热重载配置、商店、市场、PID 参数 ");
         msg(sender, "  <gold>/eb check [玩家] <dark_gray>• <gray>分析指定玩家的经济因子");
         msg(sender, "  <gold>/eb inspect <ID> <dark_gray>• <gray>实时审查物品 PID 运行数据");
         msg(sender, "  <gold>/eb save <dark_gray>• <gray>强制刷写脏数据至数据库");
@@ -79,23 +77,30 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
         msg(sender, "  <gold>/eb perf <dark_gray>• <gray>查看内存、TPS 及缓存统计");
         msg(sender, "  <gold>/eb simd <dark_gray>• <gray>CPU 向量化指令集兼容性诊断");
         msg(sender, "  <gold>/eb health <dark_gray>• <gray>系统模块健康度自动化检查");
-        msg(sender, "  <gold>/eb benchmark <dark_gray>• <gray>执行非线性压力基准测试");
+        msg(sender, "  <gold>/eb benchmark confirm <dark_gray>• <gray>执行 5M 次 PID 压力基准测试");
         msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     }
 
     private void handleReload(CommandSender sender) {
-        msg(sender, "<yellow>⟳ 正在异步重载全系统模块...");
+        msg(sender, "<yellow>⟳ 正在异步重载全系统模块（含 PID 参数）...");
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             long start = System.currentTimeMillis();
             try {
                 plugin.reloadConfig();
+
+                // 重载 PID 参数
+                plugin.getPidController().reloadConfig();
+
+                // 重载其他模块
                 plugin.getIntegrationManager().syncShops();
                 plugin.getMarketManager().updateHolidayCache();
                 plugin.getMarketManager().updateEconomyMetrics();
                 plugin.getMarketManager().updateMarketFlux();
+
                 msg(sender, "<green>✓ 重载成功! 耗时: <white>" + (System.currentTimeMillis() - start) + "ms");
             } catch (Exception e) {
                 msg(sender, "<red>✗ 重载失败: " + e.getMessage());
+                e.printStackTrace();
             }
         });
     }
@@ -120,13 +125,13 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
         msg(sender, "<yellow>⟳ 正在探测 CPU 指令集兼容性...");
         var species = jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED;
         int lanes = species.length();
-        
+
         msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         msg(sender, "<gradient:aqua:blue>SIMD 诊断报告</gradient>");
         msg(sender, " <gray>Preferred Species: <white>" + species);
         msg(sender, " <gray>Vector Width: <gold>" + (lanes * 64) + "-bit");
         msg(sender, " <gray>并行通道数: <green>" + lanes + " <dark_gray>(doubles per cycle)");
-        
+
         String tech = lanes >= 8 ? "AVX-512" : lanes >= 4 ? "AVX2/AVX" : "SSE/Neon";
         msg(sender, " <gray>硬件加速级别: <yellow>" + tech);
         msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -135,19 +140,17 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
     private void handleHealth(CommandSender sender) {
         msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         msg(sender, "<gradient:green:lime>系统健康普查</gradient>");
-        
-        // 检查数据库
-        boolean db = plugin.getDatabaseManager().getDataSource() != null && !plugin.getDatabaseManager().getDataSource().isClosed();
+
+        boolean db = plugin.getDatabaseManager().getDataSource() != null &&
+                     !plugin.getDatabaseManager().getDataSource().isClosed();
         msg(sender, " <gray>数据库连接: " + (db ? "<green>健康" : "<red>离线"));
-        
-        // 检查集成
+
         int shops = plugin.getIntegrationManager().getMonitoredItems().size();
         msg(sender, " <gray>商店映射: <white>" + (shops > 0 ? "<green>已挂载 (" + shops + ")" : "<red>无数据"));
-        
-        // 检查内存状态
+
         int pidItems = plugin.getPidController().getCacheSize();
         msg(sender, " <gray>计算内核: " + (pidItems > 0 ? "<green>活动中" : "<yellow>空闲"));
-        
+
         msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     }
 
@@ -158,12 +161,10 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
         }
         String itemId = args[1];
         var state = plugin.getPidController().inspectState(itemId);
-
         if (state == null) {
             msg(sender, "<red>✗ 物品 [<white>" + itemId + "<red>] 尚未进入 PID 缓存。");
             return;
         }
-
         msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         msg(sender, "<gradient:aqua:blue>PID 运行快照</gradient> <dark_gray>» <white>" + itemId);
         msg(sender, String.format(" <gray>Integral (积分): <aqua>%.4f", state.integral()));
@@ -179,7 +180,6 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
             msg(sender, "<red>✗ 请指定一名在线玩家。");
             return;
         }
-
         MarketManager mm = plugin.getMarketManager();
         double p = mm.calculatePersonalFactor(target);
         double f = mm.getMarketFlux();
@@ -202,8 +202,54 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
             msg(sender, "<yellow>⚠ 该操作将瞬时产生高负载。请输入 <gold>/eb benchmark confirm <yellow>确认。");
             return;
         }
-        msg(sender, "<aqua>正在启动 5,000,000 次 PID 模拟迭代测试...");
-        // 具体的基准测试逻辑可以调用 PerformanceMonitor
+
+        msg(sender, "<aqua>正在启动 5,000,000 次 PID 模拟迭代压力测试...（异步执行）");
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                PidController pid = plugin.getPidController();
+                Random rand = new Random();
+                int totalIterations = 5_000_000;
+                int batchSize = 4096;
+                long startNs = System.nanoTime();
+
+                int[] handles = new int[batchSize];
+                double[] volumes = new double[batchSize];
+
+                // 填充随机有效 handle（使用缓存中的物品）
+                List<String> monitored = plugin.getIntegrationManager().getMonitoredItems();
+                if (monitored.isEmpty()) {
+                    msg(sender, "<red>✗ 没有可用于基准测试的物品数据。");
+                    return;
+                }
+
+                for (int i = 0; i < batchSize; i++) {
+                    String id = monitored.get(i % monitored.size());
+                    handles[i] = pid.getHandle(id);
+                    volumes[i] = 800 + rand.nextDouble() * 400; // 模拟交易量波动
+                }
+
+                int batches = totalIterations / batchSize;
+                for (int b = 0; b < batches; b++) {
+                    pid.calculateBatch(handles, volumes, batchSize);
+                }
+
+                long elapsedNs = System.nanoTime() - startNs;
+                double elapsedMs = elapsedNs / 1_000_000.0;
+                double opsPerSec = totalIterations / (elapsedNs / 1_000_000_000.0);
+
+                msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                msg(sender, "<gradient:aqua:blue>Benchmark 结果</gradient>");
+                msg(sender, " <gray>总迭代次数: <white>" + totalIterations);
+                msg(sender, String.format(" <gray>耗时: <white>%.2f ms", elapsedMs));
+                msg(sender, String.format(" <gray>吞吐量: <gold>%.0f ops/s", opsPerSec));
+                msg(sender, " <gray>平均每批: <white>" + String.format("%.2f ms", elapsedMs / batches));
+                msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+            } catch (Exception e) {
+                msg(sender, "<red>✗ Benchmark 执行失败: " + e.getMessage());
+                e.printStackTrace();
+            }
+        });
     }
 
     private void handleSave(CommandSender sender) {
