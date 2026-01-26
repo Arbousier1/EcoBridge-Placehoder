@@ -1,0 +1,10 @@
+name: EcoBridge
+version: ${version}
+main: top.ellan.ecobridge.EcoBridge
+api-version: 1.20
+authors: [Ellan]
+depend:
+  - PlaceholderAPI
+softdepend:
+  - CoinsEngine
+  - UltimateShop
