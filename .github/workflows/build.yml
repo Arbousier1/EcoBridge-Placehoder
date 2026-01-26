@@ -5,7 +5,7 @@ on:
     branches: [ "master", "main" ]
   pull_request:
     branches: [ "master", "main" ]
-  workflow_dispatch: # 支持手动点击运行
+  workflow_dispatch:
 
 jobs:
   build:
@@ -21,36 +21,38 @@ jobs:
         uses: actions/setup-java@v4
         with:
           java-version: '25'
-          distribution: 'oracle' # Oracle JDK 对 Java 25 早期特性的支持较好
+          distribution: 'oracle'
           cache: 'gradle'
 
-      # [核心步骤] 检查并补全 Gradle Wrapper
+      # [核心修正] 在子目录中生成并检查 Gradle Wrapper
       - name: Setup Gradle and Generate Wrapper
+        # 请根据你的实际目录结构修改下面的 working-directory
+        working-directory: ./EcoBridge_Project 
         run: |
-          # 检查是否存在 gradlew，不存在则使用系统预装的 gradle 生成它
           if [ ! -f gradlew ]; then
-            echo "Gradlew not found, generating wrapper..."
-            gradle wrapper --gradle-version 8.10.2 # 建议使用支持 Java 21+ 的稳定 Gradle 版本
+            echo "Gradlew not found in subdirectory, generating wrapper..."
+            gradle wrapper --gradle-version 8.10.2
           fi
-          # 确保有执行权限
           chmod +x gradlew
 
       - name: Build with Gradle (SIMD Optimized)
-        # --no-daemon 适合 CI 环境，减少内存占用
-        # 这里的编译会应用你 build.gradle.kts 中的 --enable-preview 和 Vector 模块参数
+        # 同样需要指定工作目录
+        working-directory: ./EcoBridge_Project
         run: ./gradlew shadowJar --no-daemon
 
       - name: Extract Build Metadata
         id: metadata
+        working-directory: ./EcoBridge_Project
         run: |
-          # 定位生成的 Shadow Jar 文件
-          JAR_FILE=$(find build/libs -name "*-all.jar" -o -name "*.jar" | head -n 1)
-          echo "jar_path=$JAR_FILE" >> $GITHUB_OUTPUT
+          # 在子目录的 build/libs 下寻找生成的 jar
+          JAR_FILE=$(find build/libs -name "*.jar" | head -n 1)
+          echo "jar_path=EcoBridge_Project/$JAR_FILE" >> $GITHUB_OUTPUT
           echo "jar_name=$(basename $JAR_FILE)" >> $GITHUB_OUTPUT
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.metadata.outputs.jar_name }}
+          # 路径需要从根目录开始算起
           path: ${{ steps.metadata.outputs.jar_path }}
           retention-days: 5
