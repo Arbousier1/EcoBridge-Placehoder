@@ -248,22 +248,24 @@ public class PidController {
     public void flushBuffer(boolean sync) {
         if (dirtyOffsetQueue.isEmpty() || isClosed.get()) return;
 
-        // 构建快照列表
         List<DatabaseManager.PidDbSnapshot> batch = new java.util.ArrayList<>();
         Long offset;
-        int limit = 1000; // 每次最多刷写 1000 条
+        int limit = 1000;
         
-        // 加写锁：防止在读取数据组装 batch 时，SIMD 线程修改了部分数据导致状态不一致
+        // 锁的存在保证了我们要么是唯一读写者，要么在等待
         segmentLock.writeLock().lock();
         try {
             while (limit-- > 0 && (offset = dirtyOffsetQueue.poll()) != null) {
                 MemorySegment slice = memorySegment.asSlice(offset, STATE_SIZE);
                 
-                // [修复] 使用 compareAndSet 代替 getAndSet
-                // compareAndSet 的支持更广泛，并且提供了相同的原子性保证
-                boolean wasUpdated = VH_IS_DIRTY.compareAndSet(slice, 0L, (byte) 1, (byte) 0);
+                // [修复开始] 移除原子操作，改用普通读写
+                // 因为我们持有 WriteLock，所以这一步是绝对安全的
+                byte isDirty = (byte) VH_IS_DIRTY.get(slice, 0L);
                 
-                if (wasUpdated) {
+                if (isDirty == 1) {
+                    // 标记为干净 (0)
+                    VH_IS_DIRTY.set(slice, 0L, (byte) 0);
+                    
                     String itemId = findItemIdByOffset(offset); 
                     if (itemId == null) continue;
 
@@ -275,6 +277,7 @@ public class PidController {
                         (long) VH_UPDATE_TIME.get(slice, 0L)
                     ));
                 }
+                // [修复结束]
             }
         } finally {
             segmentLock.writeLock().unlock();
@@ -282,7 +285,6 @@ public class PidController {
 
         if (batch.isEmpty()) return;
         
-        // 数据库 IO 操作必须在锁外执行！否则会阻塞计算线程
         Runnable task = () -> plugin.getDatabaseManager().saveBatch(batch);
         
         if (sync) task.run();
