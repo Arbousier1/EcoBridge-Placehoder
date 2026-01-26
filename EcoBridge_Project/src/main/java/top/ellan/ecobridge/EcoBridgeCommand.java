@@ -18,14 +18,15 @@ import java.util.stream.Collectors;
 public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
 
     private final EcoBridge plugin;
-    // 创建 MiniMessage 实例，用于解析 tags
+    // [优化] 预创建 MiniMessage 实例，避免重复创建开销
     private final MiniMessage mm = MiniMessage.miniMessage();
 
     public EcoBridgeCommand(EcoBridge plugin) {
         this.plugin = plugin;
     }
 
-    // 辅助方法：发送解析后的 MiniMessage 消息
+    // [新增] 辅助方法：发送解析后的 MiniMessage 消息
+    // 支持 <red>, <gradient:red:blue> 等高级格式
     private void msg(CommandSender sender, String message) {
         sender.sendMessage(mm.deserialize(message));
     }
@@ -44,6 +45,7 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
 
         String sub = args[0].toLowerCase();
 
+        // [优化] Java 14+ Switch 表达式，更简洁
         switch (sub) {
             case "reload" -> handleReload(sender);
             case "check" -> handleCheck(sender, args);
@@ -56,8 +58,9 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
     }
 
     private void sendHelp(CommandSender sender) {
-        // <st> = strikethrough (删除线)
+        // <st> = 删除线, <bold> = 加粗
         msg(sender, "<dark_gray><st>----------------------------------------");
+        // [修复] 使用 getPluginMeta().getVersion() 替代废弃的 getDescription()
         msg(sender, "<gold><bold>EcoBridge <gray>v" + plugin.getPluginMeta().getVersion());
         msg(sender, "<yellow>/eb reload <gray>- 重载配置与缓存");
         msg(sender, "<yellow>/eb check [玩家] <gray>- 查看玩家经济因子");
@@ -87,7 +90,7 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
     private void handleSave(CommandSender sender) {
         int size = plugin.getPidController().getDirtyQueueSize();
         msg(sender, "<yellow>[EcoBridge] 正在强制刷写 <red>" + size + " <yellow>条数据...");
-        plugin.getPidController().flushBuffer(false); // Async flush
+        plugin.getPidController().flushBuffer(false); 
         msg(sender, "<green>[EcoBridge] 保存任务已提交。");
     }
 
@@ -98,7 +101,7 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
         double usedMem = totalMem - freeMem;
         
         double tps = Bukkit.getTPS()[0];
-        // 动态决定颜色 Tag
+        // 动态颜色 Tag
         String tpsColor = (tps > 18) ? "<green>" : (tps > 15 ? "<yellow>" : "<red>");
 
         msg(sender, "<dark_gray><st>----------------------------------------");
@@ -130,7 +133,6 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
             return;
         }
 
-        // 异步计算防止卡顿
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             MarketManager mm = plugin.getMarketManager();
             double personal = mm.calculatePersonalFactor(target);
@@ -190,10 +192,9 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
             return filter(args[0], Arrays.asList("reload", "check", "inspect", "save", "perf", "help"));
         }
         if (args.length == 2 && args[0].equalsIgnoreCase("check")) {
-            return null; // Return null to show online players
+            return null; 
         }
         if (args.length == 2 && args[0].equalsIgnoreCase("inspect")) {
-            // 提供已监控的物品ID补全
             return filter(args[0], plugin.getIntegrationManager().getMonitoredItems());
         }
         return Collections.emptyList();
