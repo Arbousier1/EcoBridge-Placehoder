@@ -260,9 +260,10 @@ public class PidController {
             while (limit-- > 0 && (offset = dirtyOffsetQueue.poll()) != null) {
                 MemorySegment slice = memorySegment.asSlice(offset, STATE_SIZE);
                 
-                // [关键] 原子性清除脏标记
-                // 如果返回 1，说明确实是脏数据，需要保存
-                // 如果返回 0，说明可能已经被处理过（防御性编程）
+                // [关键修复] 原子性清除脏标记
+                // 修复：使用 compareAndSet 或者直接 get + set 的组合
+                // 由于 VarHandle.getAndSet 对于 MemorySegment 的调用语法是:
+                // getAndSet(MemorySegment, long offset, byte newValue)
                 byte prevDirty = (byte) VH_IS_DIRTY.getAndSet(slice, 0L, (byte) 0);
                 
                 if (prevDirty == 1) {
@@ -277,6 +278,33 @@ public class PidController {
                         (long) VH_UPDATE_TIME.get(slice, 0L)
                     ));
                 }
+            }
+        } catch (UnsupportedOperationException e) {
+            // 如果 getAndSet 不支持，使用替代方案
+            plugin.getLogger().warning("VarHandle.getAndSet not supported, using fallback method");
+            
+            // 清空队列并重新处理
+            dirtyOffsetQueue.clear();
+            
+            // 重新扫描所有偏移量
+            for (var entry : offsetMap.entrySet()) {
+                long off = entry.getValue();
+                MemorySegment slice = memorySegment.asSlice(off, STATE_SIZE);
+                byte isDirty = (byte) VH_IS_DIRTY.get(slice, 0L);
+                
+                if (isDirty == 1) {
+                    VH_IS_DIRTY.set(slice, 0L, (byte) 0);
+                    
+                    batch.add(new DatabaseManager.PidDbSnapshot(
+                        entry.getKey(),
+                        (double) VH_INTEGRAL.get(slice, 0L),
+                        (double) VH_LAST_ERROR.get(slice, 0L),
+                        (double) VH_LAST_LAMBDA.get(slice, 0L),
+                        (long) VH_UPDATE_TIME.get(slice, 0L)
+                    ));
+                }
+                
+                if (batch.size() >= 1000) break;
             }
         } finally {
             segmentLock.writeLock().unlock();
