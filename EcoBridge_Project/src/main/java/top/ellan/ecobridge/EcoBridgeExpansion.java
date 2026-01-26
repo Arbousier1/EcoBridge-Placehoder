@@ -6,13 +6,6 @@ import org.jetbrains.annotations.NotNull;
 
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * EcoBridgeExpansion - PlaceholderAPI 集成 (Fix 1.2)
- * 
- * 修复:
- * 1. 移除了未使用的 handle 变量警告
- * 2. 实现了真正的 PID 数据查询 (依赖 OptimizedPidController.getLambdaByString)
- */
 public class EcoBridgeExpansion extends PlaceholderExpansion {
     
     private final EcoBridge plugin;

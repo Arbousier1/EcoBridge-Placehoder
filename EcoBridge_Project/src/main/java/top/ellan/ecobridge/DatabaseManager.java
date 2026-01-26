@@ -9,17 +9,6 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 
-/**
- * DatabaseManager - 批量优化版（已支持 config.yml 中的 database.pool.* 配置）
- *
- * 优化点:
- * 1. PreparedStatement 复用池
- * 2. 智能批量大小调整 (自适应)
- * 3. VirtualThread 异步加载
- * 4. 连接池预热
- * 5. 批量操作合并 (Batch Coalescing)
- * 6. 【新增】完全从 config.yml 读取 database.pool.* 参数（不再硬编码）
- */
 public class DatabaseManager {
 
     public record PidDbSnapshot(String itemId, double integral, double lastError,

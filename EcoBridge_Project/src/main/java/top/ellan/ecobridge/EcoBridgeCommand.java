@@ -15,15 +15,6 @@ import java.util.List;
 import java.util.Random;
 import java.util.stream.Collectors;
 
-/**
- * EcoBridgeCommand - 极限优化版指令处理器
- *
- * 已修复 & 增强:
- * 1. handleReload 中新增 pidController.reloadConfig() 支持 PID 参数热重载
- * 2. handleBenchmark 实现真实 5,000,000 次 PID 迭代压力测试（异步执行 + 报告结果）
- * 3. 完善 SIMD 诊断与性能报告
- * 4. 增强 MiniMessage 视觉反馈与错误处理
- */
 public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
     private final EcoBridge plugin;
     private final MiniMessage mm = MiniMessage.miniMessage();

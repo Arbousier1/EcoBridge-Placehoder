@@ -22,14 +22,6 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
 
-/**
- * MarketManager - CoinsEngine Native Optimized (Fixed)
- * 
- * 修正:
- * 1. 修复了 CoinsEngine 主类引用错误 (CoinsEngine -> CoinsEnginePlugin)
- * 2. 使用 CoinsEngineAPI 静态方法获取货币
- * 3. 保持了 Paper 异步安全性和 VirtualThread 优化
- */
 public class MarketManager {
     
     private final EcoBridge plugin;

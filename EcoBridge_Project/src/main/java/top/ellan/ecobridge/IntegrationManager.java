@@ -9,19 +9,8 @@ import org.bukkit.Bukkit;
 
 import java.util.*;
 
-/**
- * 集成管理器 - 负责与 UltimateShop 数据对接
- * 
- * 修复内容:
- * 1. 适配 OptimizedPidController 的 Handle (int) 机制
- * 2. 增加 Delta 计算 (当前销量 - 上次销量)，确保 PID 获取的是流量数据
- * 3. 零 GC 采集循环
- */
 public class IntegrationManager {
 
-    /**
-     * 内部条目：缓存 PID 句柄，避免运行时 Map 查找
-     */
     private record ItemEntry(
             String rawId,       // 字符串 ID (用于指令补全)
             int pidHandle,      // PID 快速句柄 (核心优化)

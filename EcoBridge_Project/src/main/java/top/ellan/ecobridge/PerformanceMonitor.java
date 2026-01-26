@@ -11,14 +11,6 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
-/**
- * PerformanceMonitor (Thread-Safe Edition)
- * 
- * 修复:
- * 1. 解决了 threadBean, youngGC, oldGC 未使用的警告 (现在已加入报告)
- * 2. 保持了 Paper/Spigot 的主线程安全原则
- * 3. 增强了 GC 和线程状态的监控输出
- */
 public class PerformanceMonitor {
     
     private final EcoBridge plugin;

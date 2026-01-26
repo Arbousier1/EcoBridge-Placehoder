@@ -7,16 +7,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.StampedLock;
 
-/**
- * PidController (Ultimate Optimized Edition with Configurable PID Parameters + O(1) Reverse Lookup)
- *
- * 核心优化:
- * 1. Handle 机制 + 双向映射 (registry + handleToId) → flushBuffer 变为 O(1)
- * 2. 完全可配置的 PID 参数（从 config.yml 读取）
- * 3. Zero-GC: ThreadLocal 上下文缓冲 + 自动扩容数组
- * 4. Data Swizzling + SIMD + FMA + ILP
- * 5. False Sharing 防护 (Cache Line Padding)
- */
 public class PidController implements AutoCloseable {
 
     // ==================== 1. 向量化与常量配置 ====================
@@ -81,9 +71,7 @@ public class PidController implements AutoCloseable {
     private final Arena arena;
     private final Segment[] segments;
 
-    // 注册表（正向：itemId → handle）
     private final ConcurrentHashMap<String, Integer> registry = new ConcurrentHashMap<>(4096);
-    // 反向映射（handle → itemId）← 解决 flushBuffer 瓶颈
     private final ConcurrentHashMap<Integer, String> handleToId = new ConcurrentHashMap<>(4096);
 
     private final AtomicBoolean closed = new AtomicBoolean(false);
@@ -160,7 +148,7 @@ public class PidController implements AutoCloseable {
                     return -1;
                 }
                 int handle = (segId << 16) | slot;
-                handleToId.put(handle, id); // O(1) 反向映射
+                handleToId.put(handle, id);
                 return handle;
             } finally {
                 seg.lock.unlockWrite(stamp);
@@ -212,7 +200,6 @@ public class PidController implements AutoCloseable {
         }
 
         if (plugin.getPerformanceMonitor() != null) {
-            // 因为这是批量计算，我们记录一次高质量的 SIMD 计算
             plugin.getPerformanceMonitor().recordCalculation(true);
         }
     }
@@ -262,7 +249,7 @@ public class PidController implements AutoCloseable {
                 VectorMask<Double> maskDead = vErrRaw.abs().compare(VectorOperators.LT, vDeadband);
                 DoubleVector vErr = vErrRaw.blend(vZero, maskDead);
 
-                // D Term (提前发射除法)
+                // D Term
                 DoubleVector vDPart = vErr.sub(vLastErr).div(vDt);
 
                 // Integral Decay (FMA)
@@ -459,7 +446,7 @@ public class PidController implements AutoCloseable {
                     if (seg.dirty.get(B_LAYOUT, (long) i) == (byte) 1) {
                         seg.dirty.set(B_LAYOUT, (long) i, (byte) 0);
                         int targetHandle = (segId << 16) | i;
-                        String itemId = handleToId.get(targetHandle); // O(1) 反向查找
+                        String itemId = handleToId.get(targetHandle);
                         if (itemId != null) {
                             long offset = (long) i * D_SIZE;
                             batch.add(new DatabaseManager.PidDbSnapshot(

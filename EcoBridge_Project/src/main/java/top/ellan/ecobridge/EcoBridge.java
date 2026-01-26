@@ -4,16 +4,6 @@ import org.bukkit.Bukkit;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitRunnable;
 
-/**
- * EcoBridge - 主插件类（最终优化版）
- *
- * 已修复：
- * 1. onDisable 关闭序列（flush → 等待DB队列 → closePool → close Arena）
- * 2. waitForDatabaseManager 检查 DatabaseManager 队列深度
- * 3. 初始化顺序优化（syncShops → loadAllStates）
- * 4. PID 参数热重载支持
- * 5. warmupCriticalPaths 逻辑完善
- */
 public class EcoBridge extends JavaPlugin {
     private static EcoBridge instance;
 
