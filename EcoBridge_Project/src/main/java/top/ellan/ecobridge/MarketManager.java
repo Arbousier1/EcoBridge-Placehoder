@@ -238,7 +238,7 @@ public class MarketManager {
     /**
      * 更新活跃系数
      */
-    public void updateActivityFactor() {
+public void updateActivityFactor() {
         Bukkit.getScheduler().runTask(plugin, () -> {
             int online = Bukkit.getOnlinePlayers().size();
             double tps = 20.0;
@@ -252,16 +252,21 @@ public class MarketManager {
             
             double base = plugin.getConfig().getDouble("activity.base", 1.0);
             double impact = plugin.getConfig().getDouble("activity.player-impact", 0.001);
+            
+            // 基础分：基础值 + 人数加成
             double factor = base + (online * impact);
             
-            // TPS 惩罚
+            // --- TPS 惩罚逻辑 ---
             double tpsLimit = plugin.getConfig().getDouble("activity.tps-limit", 18.0);
             if (tps < tpsLimit) {
                 double weight = plugin.getConfig().getDouble("activity.tps-weight", 0.05);
-                factor += (20.0 - Math.max(5.0, tps)) * weight;
+                // 核心修改：使用 -= 减去差值，实现卡顿降价
+                double penalty = (20.0 - tps) * weight;
+                factor -= penalty;
             }
             
-            activityFactor.set(factor);
+            // 兜底保护：确保系数不会变成负数（最小保留 0.1 倍）
+            activityFactor.set(Math.max(0.1, factor));
         });
     }
     

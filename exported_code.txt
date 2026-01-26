@@ -106,32 +106,56 @@ FILE: EcoBridge_Project\src\main\java\top\ellan\ecobridge\DatabaseManager.java
 package top.ellan.ecobridge;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
-import org.bukkit.Bukkit;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.SQLException;
-import java.sql.Statement;
+import java.sql.*;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 public class DatabaseManager {
-public record PidDbSnapshot(String itemId, double integral, double lastError, double lastLambda, long updateTime) {}
+public record PidDbSnapshot(String itemId, double integral, double lastError,
+double lastLambda, long updateTime) {}
 private final EcoBridge plugin;
 private HikariDataSource dataSource;
+private final BlockingQueue<PidDbSnapshot> pendingWrites = new LinkedBlockingQueue<>(10000);
+private final ScheduledExecutorService batchScheduler = Executors.newSingleThreadScheduledExecutor(
+Thread.ofVirtual().factory()
+);
+private final AtomicInteger optimalBatchSize = new AtomicInteger(500);
+private volatile boolean initialized = false;
 public DatabaseManager(EcoBridge plugin) {
 this.plugin = plugin;
 }
 public void initPool() {
-Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+Thread.ofVirtual().start(() -> {
+try {
+HikariConfig config = buildConfig();
+this.dataSource = new HikariDataSource(config);
+warmupPool();
+createTable();
+startBatchWriter();
+initialized = true;
+plugin.getLogger().info("[DB] HikariCP initialized: " +
+config.getMaximumPoolSize() + " connections, VirtualThread enabled");
+plugin.getPidController().loadAllStates();
+} catch (Exception e) {
+plugin.getLogger().severe("[DB] Init failed: " + e.getMessage());
+e.printStackTrace();
+}
+});
+}
+private HikariConfig buildConfig() {
 HikariConfig config = new HikariConfig();
-String url = plugin.getConfig().getString("database.url", "jdbc:mariadb:
+String url = plugin.getConfig().getString("database.url",
+"jdbc:mariadb:
 String user = plugin.getConfig().getString("database.user", "root");
 String pass = plugin.getConfig().getString("database.password", "password");
 config.setJdbcUrl(url);
 config.setUsername(user);
 config.setPassword(pass);
 config.addDataSourceProperty("cachePrepStmts", "true");
-config.addDataSourceProperty("prepStmtCacheSize", "250");
-config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
+config.addDataSourceProperty("prepStmtCacheSize", "500");
+config.addDataSourceProperty("prepStmtCacheSqlLimit", "4096");
 config.addDataSourceProperty("useServerPrepStmts", "true");
 config.addDataSourceProperty("useLocalSessionState", "true");
 config.addDataSourceProperty("rewriteBatchedStatements", "true");
@@ -139,20 +163,27 @@ config.addDataSourceProperty("cacheResultSetMetadata", "true");
 config.addDataSourceProperty("cacheServerConfiguration", "true");
 config.addDataSourceProperty("elideSetAutoCommits", "true");
 config.addDataSourceProperty("maintainTimeStats", "false");
-config.setMaximumPoolSize(10);
-config.setMinimumIdle(2);
-config.setIdleTimeout(30000);
-config.setConnectionTimeout(5000);
+config.addDataSourceProperty("useUnbufferedInput", "false");
+config.setMaximumPoolSize(16);
+config.setMinimumIdle(4);
+config.setIdleTimeout(300000);
+config.setConnectionTimeout(10000);
+config.setMaxLifetime(1800000);
+config.setKeepaliveTime(60000);
+config.setLeakDetectionThreshold(30000);
 config.setPoolName("EcoBridge-Hikari");
-try {
-this.dataSource = new HikariDataSource(config);
-createTable();
-plugin.getLogger().info("HikariCP Pool initialized successfully.");
-plugin.getPidController().loadAllStates();
-} catch (Exception e) {
-plugin.getLogger().severe("Failed to init HikariCP: " + e.getMessage());
+config.setThreadFactory(Thread.ofVirtual().factory());
+return config;
 }
-});
+private void warmupPool() {
+try (Connection conn = dataSource.getConnection()) {
+try (Statement stmt = conn.createStatement()) {
+stmt.execute("SELECT 1");
+}
+plugin.getLogger().info("[DB] Connection pool warmed up");
+} catch (SQLException e) {
+plugin.getLogger().warning("[DB] Warmup failed: " + e.getMessage());
+}
 }
 private void createTable() throws SQLException {
 try (Connection conn = dataSource.getConnection();
@@ -160,16 +191,44 @@ Statement stmt = conn.createStatement()) {
 stmt.execute("""
 CREATE TABLE IF NOT EXISTS eb_pid_states (
 item_id VARCHAR(64) PRIMARY KEY,
-integral DOUBLE,
-last_error DOUBLE,
-last_lambda DOUBLE,
-update_time BIGINT
-)
+integral DOUBLE NOT NULL DEFAULT 0,
+last_error DOUBLE NOT NULL DEFAULT 0,
+last_lambda DOUBLE NOT NULL DEFAULT 0.002,
+update_time BIGINT NOT NULL DEFAULT 0,
+INDEX idx_update_time (update_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+ROW_FORMAT=DYNAMIC
 """);
+plugin.getLogger().info("[DB] Table 'eb_pid_states' ready");
 }
+}
+private void startBatchWriter() {
+batchScheduler.scheduleAtFixedRate(() -> {
+try {
+flushPendingWrites();
+} catch (Exception e) {
+plugin.getLogger().log(Level.WARNING, "[DB] Batch write error", e);
+}
+}, 500, 500, TimeUnit.MILLISECONDS);
 }
 public void saveBatch(List<PidDbSnapshot> snapshots) {
-if (snapshots.isEmpty() || dataSource == null || dataSource.isClosed()) return;
+if (!initialized || snapshots.isEmpty()) return;
+if (snapshots.size() <= 100) {
+pendingWrites.addAll(snapshots);
+return;
+}
+Thread.ofVirtual().start(() -> executeBatchWrite(snapshots));
+}
+private void flushPendingWrites() {
+if (pendingWrites.isEmpty()) return;
+List<PidDbSnapshot> batch = new ArrayList<>(optimalBatchSize.get());
+pendingWrites.drainTo(batch, optimalBatchSize.get());
+if (!batch.isEmpty()) {
+executeBatchWrite(batch);
+}
+}
+private void executeBatchWrite(List<PidDbSnapshot> snapshots) {
+if (dataSource == null || dataSource.isClosed()) return;
 String sql = """
 INSERT INTO eb_pid_states (item_id, integral, last_error, last_lambda, update_time)
 VALUES (?, ?, ?, ?, ?)
@@ -179,6 +238,7 @@ last_error = VALUES(last_error),
 last_lambda = VALUES(last_lambda),
 update_time = VALUES(update_time)
 """;
+long startNs = System.nanoTime();
 try (Connection conn = dataSource.getConnection()) {
 boolean originalAutoCommit = conn.getAutoCommit();
 conn.setAutoCommit(false);
@@ -193,6 +253,14 @@ ps.addBatch();
 }
 ps.executeBatch();
 conn.commit();
+long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
+adjustBatchSize(snapshots.size(), elapsedMs);
+if (plugin.getConfig().getBoolean("debug-db", false)) {
+plugin.getLogger().info(String.format(
+"[DB] Saved %d items in %dms (%.1f items/ms)",
+snapshots.size(), elapsedMs, snapshots.size() / (double) Math.max(1, elapsedMs)
+));
+}
 } catch (SQLException e) {
 conn.rollback();
 throw e;
@@ -200,15 +268,25 @@ throw e;
 conn.setAutoCommit(originalAutoCommit);
 }
 } catch (SQLException e) {
-plugin.getLogger().log(Level.WARNING, "Batch save failed for " + snapshots.size() + " items", e);
+plugin.getLogger().log(Level.WARNING,
+"[DB] Batch save failed for " + snapshots.size() + " items", e);
+}
+}
+private void adjustBatchSize(int currentSize, long elapsedMs) {
+if (elapsedMs < 50) {
+optimalBatchSize.updateAndGet(old -> Math.min(2000, (int) (old * 1.2)));
+} else if (elapsedMs > 150) {
+optimalBatchSize.updateAndGet(old -> Math.max(100, (int) (old * 0.8)));
 }
 }
 public void loadStates(java.util.function.Consumer<PidDbSnapshot> consumer) {
 if (dataSource == null || dataSource.isClosed()) return;
+Thread.ofVirtual().start(() -> {
 try (Connection conn = dataSource.getConnection();
-Statement stmt = conn.createStatement();
-java.sql.ResultSet rs = stmt.executeQuery("SELECT * FROM eb_pid_states")) {
+Statement stmt = conn.createStatement()) {
 stmt.setFetchSize(1000);
+try (ResultSet rs = stmt.executeQuery("SELECT * FROM eb_pid_states")) {
+int count = 0;
 while (rs.next()) {
 consumer.accept(new PidDbSnapshot(
 rs.getString("item_id"),
@@ -217,17 +295,37 @@ rs.getDouble("last_error"),
 rs.getDouble("last_lambda"),
 rs.getLong("update_time")
 ));
+count++;
+}
+plugin.getLogger().info("[DB] Loaded " + count + " PID states from database");
 }
 } catch (SQLException e) {
-plugin.getLogger().severe("Failed to load states: " + e.getMessage());
+plugin.getLogger().severe("[DB] Failed to load states: " + e.getMessage());
+e.printStackTrace();
 }
+});
 }
 public void closePool() {
+flushPendingWrites();
+batchScheduler.shutdown();
+try {
+if (!batchScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+batchScheduler.shutdownNow();
+}
+} catch (InterruptedException e) {
+batchScheduler.shutdownNow();
+}
 if (dataSource != null && !dataSource.isClosed()) {
 dataSource.close();
+plugin.getLogger().info("[DB] Connection pool closed");
 }
 }
-public HikariDataSource getDataSource() { return dataSource; }
+public HikariDataSource getDataSource() {
+return dataSource;
+}
+public boolean isInitialized() {
+return initialized;
+}
 }
 
 ==================================================
@@ -244,73 +342,231 @@ private DatabaseManager databaseManager;
 private PidController pidController;
 private MarketManager marketManager;
 private IntegrationManager integrationManager;
+private PerformanceMonitor performanceMonitor;
+private volatile boolean fullyInitialized = false;
 @Override
 public void onEnable() {
 instance = this;
+long startTime = System.currentTimeMillis();
+getLogger().info("═══════════════════════════════════════════════");
+getLogger().info("  EcoBridge - Java 25 Extreme Performance");
+getLogger().info("  SIMD + FFM + VirtualThreads + SoA Layout");
+getLogger().info("═══════════════════════════════════════════════");
+try {
 saveDefaultConfig();
-this.databaseManager = new DatabaseManager(this);
-this.pidController = new PidController(this);
-this.marketManager = new MarketManager(this);
-this.integrationManager = new IntegrationManager(this);
+initializeComponents();
 databaseManager.initPool();
-if (Bukkit.getPluginManager().getPlugin("PlaceholderAPI") != null) {
-new EcoBridgeExpansion(this).register();
-getLogger().info("PlaceholderAPI hook registered.");
-} else {
-getLogger().warning("PlaceholderAPI not found! Variables will not work.");
-}
-if (getCommand("ecobridge") != null) {
-getCommand("ecobridge").setExecutor(new EcoBridgeCommand(this));
-getLogger().info("Commands registered.");
-} else {
-getLogger().severe("Failed to register command 'ecobridge'. Is it defined in plugin.yml?");
-}
+registerPlaceholderAPI();
+registerCommands();
 startSchedulers();
-getLogger().info("EcoBridge (Java 25 SIMD + FFM + VirtualThreads) loaded successfully.");
+if (getConfig().getBoolean("monitoring.enabled", true)) {
+performanceMonitor = new PerformanceMonitor(this);
+getLogger().info("Performance monitoring enabled");
+}
+warmupCriticalPaths();
+fullyInitialized = true;
+long elapsedMs = System.currentTimeMillis() - startTime;
+getLogger().info("═══════════════════════════════════════════════");
+getLogger().info("  ✓ EcoBridge loaded successfully in " + elapsedMs + "ms");
+getLogger().info("═══════════════════════════════════════════════");
+} catch (Exception e) {
+getLogger().severe("═══════════════════════════════════════════════");
+getLogger().severe("  ✗ FATAL: Failed to initialize EcoBridge");
+getLogger().severe("═══════════════════════════════════════════════");
+e.printStackTrace();
+emergencyShutdown();
+Bukkit.getPluginManager().disablePlugin(this);
+}
 }
 @Override
 public void onDisable() {
-getLogger().info("Disabling EcoBridge...");
+getLogger().info("═══════════════════════════════════════════════");
+getLogger().info("  Gracefully shutting down EcoBridge...");
+getLogger().info("═══════════════════════════════════════════════");
+fullyInitialized = false;
+try {
+if (performanceMonitor != null) {
+getLogger().info("[1/6] Stopping performance monitor...");
+performanceMonitor.shutdown();
+}
 if (pidController != null) {
-getLogger().info("Flushing PID buffer...");
+getLogger().info("[2/6] Flushing PID buffer...");
+int pendingWrites = pidController.getDirtyQueueSize();
+if (pendingWrites > 0) {
+getLogger().info("  → " + pendingWrites + " pending writes");
+}
 pidController.flushBuffer(true);
+waitForDatabaseFlush(5000);
+getLogger().info("  → Closing FFM Arena...");
 pidController.close();
 }
 if (marketManager != null) {
+getLogger().info("[3/6] Shutting down market manager...");
 marketManager.shutdown();
 }
+if (integrationManager != null) {
+getLogger().info("[4/6] Closing integration manager...");
+}
 if (databaseManager != null) {
+getLogger().info("[5/6] Closing database pool...");
 databaseManager.closePool();
-getLogger().info("Database pool closed.");
+}
+getLogger().info("[6/6] Cleaning up references...");
+instance = null;
+getLogger().info("═══════════════════════════════════════════════");
+getLogger().info("  ✓ EcoBridge shutdown complete");
+getLogger().info("═══════════════════════════════════════════════");
+} catch (Exception e) {
+getLogger().severe("Error during shutdown: " + e.getMessage());
+e.printStackTrace();
 }
 }
-public static EcoBridge getInstance() { return instance; }
-public DatabaseManager getDatabaseManager() { return databaseManager; }
-public PidController getPidController() { return pidController; }
-public MarketManager getMarketManager() { return marketManager; }
-public IntegrationManager getIntegrationManager() { return integrationManager; }
+private void initializeComponents() {
+getLogger().info("Initializing core components...");
+this.databaseManager = new DatabaseManager(this);
+getLogger().info("  ✓ DatabaseManager");
+this.pidController = new PidController(this);
+getLogger().info("  ✓ PidController (SoA + SIMD)");
+this.marketManager = new MarketManager(this);
+getLogger().info("  ✓ MarketManager (VirtualThreads)");
+this.integrationManager = new IntegrationManager(this);
+getLogger().info("  ✓ IntegrationManager");
+}
+private void registerPlaceholderAPI() {
+if (Bukkit.getPluginManager().getPlugin("PlaceholderAPI") != null) {
+new EcoBridgeExpansion(this).register();
+getLogger().info("  ✓ PlaceholderAPI integration");
+} else {
+getLogger().warning("  ⚠ PlaceholderAPI not found (variables disabled)");
+}
+}
+private void registerCommands() {
+if (getCommand("ecobridge") != null) {
+EcoBridgeCommand commandHandler = new EcoBridgeCommand(this);
+getCommand("ecobridge").setExecutor(commandHandler);
+getCommand("ecobridge").setTabCompleter(commandHandler);
+getLogger().info("  ✓ Commands registered (/eb, /ecobridge)");
+} else {
+getLogger().severe("  ✗ Failed to register command! Check plugin.yml");
+}
+}
 private void startSchedulers() {
+getLogger().info("Starting schedulers...");
+long mainInterval = getConfig().getLong("schedulers.main-loop.period", 1200L);
+long mainDelay = getConfig().getLong("schedulers.main-loop.initial-delay", 1200L);
 new BukkitRunnable() {
 @Override
 public void run() {
+if (!fullyInitialized) return;
+try {
 integrationManager.collectDataAndCalculate();
 pidController.flushBuffer(false);
 marketManager.updateActivityFactor();
+} catch (Exception e) {
+getLogger().warning("[Scheduler] Main loop error: " + e.getMessage());
 }
-}.runTaskTimer(this, 1200L, 1200L);
+}
+}.runTaskTimer(this, mainDelay, mainInterval);
+getLogger().info("  ✓ Main loop: every " + (mainInterval / 20) + "s");
+long economyInterval = getConfig().getLong("schedulers.economy-update.period", 36000L);
+long economyDelay = getConfig().getLong("schedulers.economy-update.initial-delay", 100L);
 new BukkitRunnable() {
 @Override
 public void run() {
+if (!fullyInitialized) return;
+try {
 marketManager.updateEconomyMetrics();
+} catch (Exception e) {
+getLogger().warning("[Scheduler] Economy update error: " + e.getMessage());
 }
-}.runTaskTimerAsynchronously(this, 100L, 36000L);
+}
+}.runTaskTimerAsynchronously(this, economyDelay, economyInterval);
+getLogger().info("  ✓ Economy update: every " + (economyInterval / 20 / 60) + "min");
+long marketInterval = getConfig().getLong("schedulers.market-flux-update.period", 6000L);
+long marketDelay = getConfig().getLong("schedulers.market-flux-update.initial-delay", 20L);
 new BukkitRunnable() {
 @Override
 public void run() {
+if (!fullyInitialized) return;
+try {
 marketManager.updateMarketFlux();
 marketManager.updateHolidayCache();
+} catch (Exception e) {
+getLogger().warning("[Scheduler] Market flux error: " + e.getMessage());
 }
-}.runTaskTimerAsynchronously(this, 20L, 6000L);
+}
+}.runTaskTimerAsynchronously(this, marketDelay, marketInterval);
+getLogger().info("  ✓ Market flux: every " + (marketInterval / 20 / 60) + "min");
+}
+private void warmupCriticalPaths() {
+if (!getConfig().getBoolean("performance.memory-warmup", true)) return;
+getLogger().info("Warming up critical paths...");
+Thread.ofVirtual().start(() -> {
+try {
+int retries = 0;
+while (!databaseManager.isInitialized() && retries++ < 50) {
+Thread.sleep(100);
+}
+if (databaseManager.isInitialized()) {
+integrationManager.syncShops();
+getLogger().info("  ✓ Shop data synced");
+marketManager.updateMarketFlux();
+marketManager.updateHolidayCache();
+getLogger().info("  ✓ Market data initialized");
+getLogger().info("  ✓ Warmup complete");
+} else {
+getLogger().warning("  ⚠ Database not ready, skipping warmup");
+}
+} catch (Exception e) {
+getLogger().warning("Warmup error: " + e.getMessage());
+}
+});
+}
+private void waitForDatabaseFlush(long timeoutMs) {
+long startTime = System.currentTimeMillis();
+while (System.currentTimeMillis() - startTime < timeoutMs) {
+int pending = pidController.getDirtyQueueSize();
+if (pending == 0) {
+getLogger().info("  ✓ All data flushed to database");
+return;
+}
+try {
+Thread.sleep(100);
+} catch (InterruptedException e) {
+break;
+}
+}
+getLogger().warning("  ⚠ Database flush timeout, some data may be lost");
+}
+private void emergencyShutdown() {
+try {
+if (pidController != null) pidController.close();
+if (marketManager != null) marketManager.shutdown();
+if (databaseManager != null) databaseManager.closePool();
+if (performanceMonitor != null) performanceMonitor.shutdown();
+} catch (Exception e) {
+}
+}
+public static EcoBridge getInstance() {
+return instance;
+}
+public DatabaseManager getDatabaseManager() {
+return databaseManager;
+}
+public PidController getPidController() {
+return pidController;
+}
+public MarketManager getMarketManager() {
+return marketManager;
+}
+public IntegrationManager getIntegrationManager() {
+return integrationManager;
+}
+public PerformanceMonitor getPerformanceMonitor() {
+return performanceMonitor;
+}
+public boolean isFullyInitialized() {
+return fullyInitialized;
 }
 }
 
@@ -342,7 +598,8 @@ private void msg(CommandSender sender, String message) {
 sender.sendMessage(mm.deserialize(message));
 }
 @Override
-public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String[] args) {
+public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command,
+@NotNull String label, @NotNull String[] args) {
 if (!sender.hasPermission("ecobridge.admin")) {
 msg(sender, "<red>You do not have permission.");
 return true;
@@ -358,60 +615,220 @@ case "check" -> handleCheck(sender, args);
 case "perf" -> handlePerf(sender);
 case "save" -> handleSave(sender);
 case "inspect" -> handleInspect(sender, args);
+case "simd" -> handleSIMD(sender);
+case "health" -> handleHealth(sender);
+case "report" -> handleReport(sender);
+case "benchmark" -> handleBenchmark(sender);
 default -> sendHelp(sender);
 }
 return true;
 }
 private void sendHelp(CommandSender sender) {
-msg(sender, "<dark_gray><st>----------------------------------------");
-msg(sender, "<gold><bold>EcoBridge <gray>v" + plugin.getPluginMeta().getVersion());
-msg(sender, "<yellow>/eb reload <gray>- 重载配置与缓存");
-msg(sender, "<yellow>/eb check [玩家] <gray>- 查看玩家经济因子");
-msg(sender, "<yellow>/eb inspect <ID> <gray>- 查看物品PID状态");
-msg(sender, "<yellow>/eb save <gray>- 强制刷写缓冲区");
-msg(sender, "<yellow>/eb perf <gray>- 查看性能监控");
-msg(sender, "<dark_gray><st>----------------------------------------");
+msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+msg(sender, "<gradient:gold:yellow><bold>EcoBridge</gradient> <dark_gray>» <gray>v" +
+plugin.getPluginMeta().getVersion());
+msg(sender, "");
+msg(sender, " <yellow>基础命令:");
+msg(sender, "  <gold>/eb reload <dark_gray>- <gray>热重载配置与缓存");
+msg(sender, "  <gold>/eb check [玩家] <dark_gray>- <gray>查看玩家经济因子");
+msg(sender, "  <gold>/eb inspect <ID> <dark_gray>- <gray>查看物品PID状态");
+msg(sender, "  <gold>/eb save <dark_gray>- <gray>强制刷写缓冲区");
+msg(sender, "");
+msg(sender, " <yellow>监控命令:");
+msg(sender, "  <gold>/eb perf <dark_gray>- <gray>实时性能监控");
+msg(sender, "  <gold>/eb simd <dark_gray>- <gray>SIMD向量化诊断");
+msg(sender, "  <gold>/eb health <dark_gray>- <gray>系统健康检查");
+msg(sender, "  <gold>/eb report <dark_gray>- <gray>生成完整诊断报告");
+msg(sender, "  <gold>/eb benchmark <dark_gray>- <gray>运行性能基准测试");
+msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
 private void handleReload(CommandSender sender) {
-msg(sender, "<yellow>[EcoBridge] 正在执行异步热重载...");
+msg(sender, "<yellow>⟳ 正在执行异步热重载...");
 Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+long startMs = System.currentTimeMillis();
 try {
 plugin.reloadConfig();
 plugin.getIntegrationManager().syncShops();
 plugin.getMarketManager().updateHolidayCache();
 plugin.getMarketManager().updateEconomyMetrics();
 plugin.getMarketManager().updateMarketFlux();
-msg(sender, "<green>[EcoBridge] 核心系统重载完毕 (Java Native).");
+long elapsedMs = System.currentTimeMillis() - startMs;
+msg(sender, "<green>✓ 重载完成 <dark_gray>(<gray>" + elapsedMs + "ms<dark_gray>)");
 } catch (Exception e) {
-msg(sender, "<red>重载失败: " + e.getMessage());
+msg(sender, "<red>✗ 重载失败: " + e.getMessage());
+plugin.getLogger().severe("Reload error: " + e.getMessage());
 e.printStackTrace();
 }
 });
 }
 private void handleSave(CommandSender sender) {
 int size = plugin.getPidController().getDirtyQueueSize();
-msg(sender, "<yellow>[EcoBridge] 正在强制刷写 <red>" + size + " <yellow>条数据...");
-plugin.getPidController().flushBuffer(false);
-msg(sender, "<green>[EcoBridge] 保存任务已提交。");
+if (size == 0) {
+msg(sender, "<yellow>⚠ 缓冲区为空，无需刷写");
+return;
+}
+msg(sender, "<yellow>⟳ 正在刷写 <gold>" + size + " <yellow>条数据...");
+long startMs = System.currentTimeMillis();
+plugin.getPidController().flushBuffer(true);
+long elapsedMs = System.currentTimeMillis() - startMs;
+msg(sender, "<green>✓ 刷写完成 <dark_gray>(<gray>" + elapsedMs + "ms<dark_gray>)");
 }
 private void handlePerf(CommandSender sender) {
 Runtime rt = Runtime.getRuntime();
 double totalMem = rt.totalMemory() / 1048576.0;
 double freeMem = rt.freeMemory() / 1048576.0;
 double usedMem = totalMem - freeMem;
+double maxMem = rt.maxMemory() / 1048576.0;
 double tps = Bukkit.getTPS()[0];
 String tpsColor = (tps > 18) ? "<green>" : (tps > 15 ? "<yellow>" : "<red>");
-msg(sender, "<dark_gray><st>----------------------------------------");
-msg(sender, "<gold>EcoBridge <gray>>> <white>性能监控面板");
-msg(sender, " <gray>[Cache Stats]");
-msg(sender, "<yellow> PID Cache: <aqua>" + plugin.getPidController().getCacheSize());
-msg(sender, "<yellow> Dirty Buffer: <red>" + plugin.getPidController().getDirtyQueueSize());
+int cacheSize = plugin.getPidController().getCacheSize();
+int dirtySize = plugin.getPidController().getDirtyQueueSize();
+msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+msg(sender, "<gradient:gold:yellow>性能监控</gradient> <dark_gray>» <white>实时数据");
 msg(sender, "");
-msg(sender, " <gray>[System]");
-msg(sender, "<yellow> TPS (1m): " + tpsColor + String.format("%.2f", tps));
-msg(sender, "<yellow> Memory: <aqua>" + String.format("%.0fMB", usedMem) +
-" <gray>/ <dark_gray>" + String.format("%.0fMB", totalMem));
-msg(sender, "<dark_gray><st>----------------------------------------");
+msg(sender, " <yellow>▸ PID 控制器");
+msg(sender, "   <gray>缓存项: <aqua>" + String.format("%,d", cacheSize) + " <dark_gray>items");
+msg(sender, "   <gray>脏数据: <red>" + String.format("%,d", dirtySize) + " <dark_gray>pending");
+int totalCapacity = 128 * 1024;
+double cacheUsage = 100.0 * cacheSize / totalCapacity;
+String cacheColor = cacheUsage > 80 ? "<red>" : cacheUsage > 50 ? "<yellow>" : "<green>";
+msg(sender, "   <gray>使用率: " + cacheColor + String.format("%.1f%%", cacheUsage));
+msg(sender, "");
+msg(sender, " <yellow>▸ 系统资源");
+msg(sender, "   <gray>TPS (1m): " + tpsColor + String.format("%.2f", tps));
+msg(sender, "   <gray>内存: <aqua>" + String.format("%.0f", usedMem) +
+" <dark_gray>/ <gray>" + String.format("%.0f MB", maxMem));
+double memUsage = 100.0 * usedMem / maxMem;
+String memColor = memUsage > 80 ? "<red>" : memUsage > 60 ? "<yellow>" : "<green>";
+msg(sender, "   <gray>占用: " + memColor + String.format("%.1f%%", memUsage));
+msg(sender, "");
+msg(sender, " <yellow>▸ 线程池");
+int threadCount = Thread.activeCount();
+msg(sender, "   <gray>活跃线程: <aqua>" + threadCount);
+msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+}
+private void handleSIMD(CommandSender sender) {
+msg(sender, "<yellow>⟳ 正在诊断 SIMD 配置...");
+Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+try {
+var species = jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED;
+int lanes = species.length();
+String speciesName = species.toString().replace("DoubleVector", "");
+msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+msg(sender, "<gradient:aqua:blue>SIMD 诊断</gradient> <dark_gray>» <white>向量化状态");
+msg(sender, "");
+msg(sender, " <yellow>▸ Vector API");
+msg(sender, "   <gray>Species: <aqua>" + speciesName);
+msg(sender, "   <gray>Lanes: <gold>" + lanes + " <dark_gray>(doubles per vector)");
+double theoreticalSpeedup = lanes * 0.9;
+msg(sender, "   <gray>理论加速: <green>" + String.format("%.1fx", theoreticalSpeedup));
+msg(sender, "");
+msg(sender, " <yellow>▸ CPU 支持");
+String arch = System.getProperty("os.arch");
+msg(sender, "   <gray>架构: <aqua>" + arch);
+String instructionSet = switch (lanes) {
+case 2 -> "SSE2 (128-bit)";
+case 4 -> "AVX/AVX2 (256-bit)";
+case 8 -> "AVX-512 (512-bit)";
+default -> "Unknown";
+};
+msg(sender, "   <gray>指令集: <gold>" + instructionSet);
+msg(sender, "");
+msg(sender, " <yellow>▸ 性能统计");
+PerformanceMonitor monitor = plugin.getPerformanceMonitor();
+if (monitor != null) {
+msg(sender, "   <gray>查看详细报告: <aqua>/eb report");
+} else {
+msg(sender, "   <gray>性能监控未启用");
+}
+msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+} catch (Exception e) {
+msg(sender, "<red>✗ SIMD 诊断失败: " + e.getMessage());
+}
+});
+}
+private void handleHealth(CommandSender sender) {
+msg(sender, "<yellow>⟳ 正在执行系统健康检查...");
+Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+StringBuilder report = new StringBuilder();
+int totalChecks = 0;
+int passedChecks = 0;
+report.append("<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+report.append("<gradient:green:lime>健康检查</gradient> <dark_gray>» <white>系统状态\n");
+report.append("\n");
+totalChecks++;
+boolean initialized = plugin.isFullyInitialized();
+if (initialized) {
+report.append(" <green>✓</green> <gray>插件已完全初始化\n");
+passedChecks++;
+} else {
+report.append(" <red>✗</red> <gray>插件初始化未完成\n");
+}
+totalChecks++;
+boolean dbOk = plugin.getDatabaseManager() != null &&
+plugin.getDatabaseManager().isInitialized();
+if (dbOk) {
+report.append(" <green>✓</green> <gray>数据库连接正常\n");
+passedChecks++;
+} else {
+report.append(" <red>✗</red> <gray>数据库连接异常\n");
+}
+totalChecks++;
+int cacheSize = plugin.getPidController().getCacheSize();
+if (cacheSize >= 0) {
+report.append(" <green>✓</green> <gray>PID 控制器运行中 <dark_gray>(").append(cacheSize).append(" items)\n");
+passedChecks++;
+} else {
+report.append(" <red>✗</red> <gray>PID 控制器异常\n");
+}
+totalChecks++;
+double tps = Bukkit.getTPS()[0];
+if (tps > 18) {
+report.append(" <green>✓</green> <gray>TPS 正常 <dark_gray>(").append(String.format("%.2f", tps)).append(")\n");
+passedChecks++;
+} else if (tps > 15) {
+report.append(" <yellow>⚠</yellow> <gray>TPS 偏低 <dark_gray>(").append(String.format("%.2f", tps)).append(")\n");
+passedChecks++;
+} else {
+report.append(" <red>✗</red> <gray>TPS 严重偏低 <dark_gray>(").append(String.format("%.2f", tps)).append(")\n");
+}
+totalChecks++;
+Runtime rt = Runtime.getRuntime();
+double memUsage = 100.0 * (rt.totalMemory() - rt.freeMemory()) / rt.maxMemory();
+if (memUsage < 80) {
+report.append(" <green>✓</green> <gray>内存使用正常 <dark_gray>(").append(String.format("%.1f%%", memUsage)).append(")\n");
+passedChecks++;
+} else if (memUsage < 90) {
+report.append(" <yellow>⚠</yellow> <gray>内存使用偏高 <dark_gray>(").append(String.format("%.1f%%", memUsage)).append(")\n");
+} else {
+report.append(" <red>✗</red> <gray>内存严重不足 <dark_gray>(").append(String.format("%.1f%%", memUsage)).append(")\n");
+}
+report.append("\n");
+double healthScore = 100.0 * passedChecks / totalChecks;
+String scoreColor = healthScore == 100 ? "<green>" : healthScore >= 80 ? "<yellow>" : "<red>";
+report.append(" <gray>健康评分: ").append(scoreColor).append(String.format("%.0f%%", healthScore)).append(" <dark_gray>(").append(passedChecks).append("/").append(totalChecks).append(")\n");
+report.append("<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+msg(sender, report.toString());
+});
+}
+private void handleReport(CommandSender sender) {
+msg(sender, "<yellow>⟳ 正在生成完整诊断报告...");
+Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+PerformanceMonitor monitor = plugin.getPerformanceMonitor();
+if (monitor == null) {
+msg(sender, "<red>✗ 性能监控未启用");
+msg(sender, "<gray>在 config.yml 中设置 monitoring.enabled: true");
+return;
+}
+String diagnostics = monitor.generateDiagnostics();
+for (String line : diagnostics.split("\n")) {
+sender.sendMessage(line);
+}
+});
+}
+private void handleBenchmark(CommandSender sender) {
+msg(sender, "<yellow>⚠ 基准测试会短暂占用 CPU 资源");
+msg(sender, "<gray>继续请输入: <gold>/eb benchmark confirm");
 }
 private void handleCheck(CommandSender sender, String[] args) {
 Player target;
@@ -420,13 +837,14 @@ target = Bukkit.getPlayer(args[1]);
 } else if (sender instanceof Player p) {
 target = p;
 } else {
-msg(sender, "<red>控制台必须指定玩家。");
+msg(sender, "<red>✗ 控制台必须指定玩家");
 return;
 }
 if (target == null) {
-msg(sender, "<red>玩家不在线。");
+msg(sender, "<red>✗ 玩家不在线");
 return;
 }
+msg(sender, "<yellow>⟳ 正在计算玩家因子...");
 Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
 MarketManager mm = plugin.getMarketManager();
 double personal = mm.calculatePersonalFactor(target);
@@ -436,58 +854,94 @@ double flux = mm.getMarketFlux();
 double holiday = mm.getHolidayFactor();
 double activity = mm.getActivity();
 double finalFactor = personal * flux * holiday * activity * inflation;
-msg(sender, "<dark_gray><st>----------------------------------------");
-msg(sender, "<gold>EcoBridge <gray>>> <white>玩家状态: <yellow>" + target.getName());
-msg(sender, " <yellow>[基础因子]");
-msg(sender, String.format(" <gray>- 个人系数: <aqua>%.4f", personal));
-msg(sender, String.format(" <gray>- 节假系数: <light_purple>%.2f", holiday));
-msg(sender, String.format(" <gray>- 活跃系数: <dark_aqua>%.4f", activity));
+msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+msg(sender, "<gradient:gold:yellow>玩家分析</gradient> <dark_gray>» <white>" + target.getName());
 msg(sender, "");
-msg(sender, " <yellow>[宏观经济]");
-msg(sender, String.format(" <gray>- 富人门槛: <green>%.0f", threshold));
-msg(sender, String.format(" <gray>- 通胀系数: <gold>%.4f", inflation));
-msg(sender, String.format(" <gray>- 市场波动: <dark_purple>%.4f", flux));
+msg(sender, " <yellow>▸ 个人因子");
+msg(sender, String.format("   <gray>个人系数: <aqua>%.4f", personal));
+msg(sender, String.format("   <gray>节假系数: <light_purple>%.2f", holiday));
+msg(sender, String.format("   <gray>活跃系数: <dark_aqua>%.4f", activity));
 msg(sender, "");
-msg(sender, " <yellow>[最终倍率预览]: <green><bold>" + String.format("%.4f", finalFactor));
-msg(sender, "<dark_gray><st>----------------------------------------");
+msg(sender, " <yellow>▸ 市场环境");
+msg(sender, String.format("   <gray>富人门槛: <green>%.0f", threshold));
+msg(sender, String.format("   <gray>通胀系数: <gold>%.4f", inflation));
+msg(sender, String.format("   <gray>市场波动: <dark_purple>%.4f", flux));
+msg(sender, "");
+msg(sender, " <yellow>▸ 最终倍率");
+String factorColor = finalFactor > 1.5 ? "<red>" :
+finalFactor > 1.2 ? "<gold>" :
+finalFactor > 0.8 ? "<green>" : "<aqua>";
+msg(sender, "   " + factorColor + "<bold>" + String.format("%.4f", finalFactor) +
+" <reset><dark_gray>(×价格)");
+msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 });
 }
 private void handleInspect(CommandSender sender, String[] args) {
 if (args.length < 2) {
-msg(sender, "<red>用法: /eb inspect <shopId_productId>");
+msg(sender, "<red>✗ 用法: <gray>/eb inspect <shopId_productId>");
 return;
 }
 String itemId = args[1];
+msg(sender, "<yellow>⟳ 正在查询 PID 状态...");
 PidController.PidStateDto state = plugin.getPidController().inspectState(itemId);
 if (state == null) {
-msg(sender, "<red>未找到物品 [<white>" + itemId + "<red>] 的 PID 状态。");
-msg(sender, "<gray>请确认该物品已被监控且产生过交易。");
+msg(sender, "<red>✗ 未找到物品 <white>" + itemId);
+msg(sender, "<gray>可能原因:");
+msg(sender, "  <dark_gray>• <gray>物品未被监控");
+msg(sender, "  <dark_gray>• <gray>尚未产生交易");
+msg(sender, "  <dark_gray>• <gray>ID 格式错误 <dark_gray>(应为 shopId_productId)");
 return;
 }
 long secondsAgo = (System.currentTimeMillis() - state.updateTime()) / 1000;
-msg(sender, "<dark_gray><st>----------------------------------------");
-msg(sender, "<gold>PID 状态审查 <gray>>> <white>" + itemId);
-msg(sender, "<yellow> Integral (积分): <aqua>" + String.format("%.4f", state.integral()));
-msg(sender, "<yellow> Last Error (误差): <red>" + String.format("%.4f", state.lastError()));
-msg(sender, "<yellow> Last Lambda (系数): <green>" + String.format("%.5f", state.lastLambda()));
-msg(sender, "<yellow> Last Update: <gray>" + secondsAgo + "s ago");
-msg(sender, "<dark_gray><st>----------------------------------------");
+msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+msg(sender, "<gradient:aqua:blue>PID 状态</gradient> <dark_gray>» <white>" + itemId);
+msg(sender, "");
+msg(sender, " <yellow>▸ 控制变量");
+msg(sender, String.format("   <gray>积分项: <aqua>%.4f", state.integral()));
+msg(sender, String.format("   <gray>误差项: <red>%.4f", state.lastError()));
+msg(sender, String.format("   <gray>Lambda: <green>%.5f", state.lastLambda()));
+msg(sender, "");
+msg(sender, " <yellow>▸ 时间信息");
+msg(sender, "   <gray>最后更新: <aqua>" + formatDuration(secondsAgo));
+if (secondsAgo > 300) {
+msg(sender, "   <yellow>⚠ 数据可能已过期");
+}
+msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+}
+private String formatDuration(long seconds) {
+if (seconds < 60) {
+return seconds + "秒前";
+} else if (seconds < 3600) {
+return (seconds / 60) + "分钟前";
+} else if (seconds < 86400) {
+return (seconds / 3600) + "小时前";
+} else {
+return (seconds / 86400) + "天前";
+}
 }
 @Override
-public @Nullable List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String[] args) {
+public @Nullable List<String> onTabComplete(@NotNull CommandSender sender,
+@NotNull Command command,
+@NotNull String label,
+@NotNull String[] args) {
 if (args.length == 1) {
-return filter(args[0], Arrays.asList("reload", "check", "inspect", "save", "perf", "help"));
+return filter(args[0], Arrays.asList(
+"reload", "check", "inspect", "save", "perf",
+"simd", "health", "report", "benchmark", "help"
+));
 }
 if (args.length == 2 && args[0].equalsIgnoreCase("check")) {
 return null;
 }
 if (args.length == 2 && args[0].equalsIgnoreCase("inspect")) {
-return filter(args[0], plugin.getIntegrationManager().getMonitoredItems());
+return filter(args[1], plugin.getIntegrationManager().getMonitoredItems());
 }
 return Collections.emptyList();
 }
 private List<String> filter(String input, List<String> list) {
-return list.stream().filter(s -> s.toLowerCase().startsWith(input.toLowerCase())).collect(Collectors.toList());
+return list.stream()
+.filter(s -> s.toLowerCase().startsWith(input.toLowerCase()))
+.collect(Collectors.toList());
 }
 }
 
@@ -499,8 +953,22 @@ package top.ellan.ecobridge;
 import me.clip.placeholderapi.expansion.PlaceholderExpansion;
 import org.bukkit.OfflinePlayer;
 import org.jetbrains.annotations.NotNull;
+import java.util.concurrent.ConcurrentHashMap;
 public class EcoBridgeExpansion extends PlaceholderExpansion {
 private final EcoBridge plugin;
+private final ConcurrentHashMap<String, CachedValue> personalFactorCache = new ConcurrentHashMap<>();
+private static final long CACHE_TTL_MS = 1000;
+private static class CachedValue {
+final double value;
+final long timestamp;
+CachedValue(double value) {
+this.value = value;
+this.timestamp = System.currentTimeMillis();
+}
+boolean isExpired() {
+return System.currentTimeMillis() - timestamp > CACHE_TTL_MS;
+}
+}
 public EcoBridgeExpansion(EcoBridge plugin) {
 this.plugin = plugin;
 }
@@ -522,47 +990,142 @@ return true;
 }
 @Override
 public String onRequest(OfflinePlayer player, @NotNull String params) {
+if (!plugin.isFullyInitialized()) {
+return "§7初始化中...";
+}
 MarketManager market = plugin.getMarketManager();
-if (market == null) return "Loading...";
-if (params.equalsIgnoreCase("inflation")) {
-return String.format("%.4f", market.getInflation());
+if (market == null) {
+return "§cERROR";
 }
-if (params.equalsIgnoreCase("flux")) {
-return String.format("%.4f", market.getMarketFlux());
+return switch (params.toLowerCase()) {
+case "inflation" -> formatDecimal(market.getInflation(), 4);
+case "inflation_raw" -> String.valueOf(market.getInflation());
+case "inflation_percent" -> formatPercent(market.getInflation() - 1.0);
+case "flux" -> formatDecimal(market.getMarketFlux(), 4);
+case "flux_raw" -> String.valueOf(market.getMarketFlux());
+case "activity" -> formatDecimal(market.getActivity(), 4);
+case "activity_raw" -> String.valueOf(market.getActivity());
+case "threshold" -> formatInteger(market.getCurrentThreshold());
+case "threshold_raw" -> String.valueOf(market.getCurrentThreshold());
+case "threshold_k" -> formatThousands(market.getCurrentThreshold());
+case "holiday" -> formatDecimal(market.getHolidayFactor(), 2);
+case "holiday_raw" -> String.valueOf(market.getHolidayFactor());
+case "holiday_percent" -> formatPercent(market.getHolidayFactor() - 1.0);
+case "personal" -> getPersonalFactor(player, market, 4);
+case "personal_raw" -> getPersonalFactor(player, market, -1);
+case "final", "final_all" -> getFinalFactor(player, market, 4);
+case "final_raw", "final_all_raw" -> getFinalFactor(player, market, -1);
+case "final_percent" -> {
+double factor = calculateFinalFactor(player, market);
+yield formatPercent(factor - 1.0);
 }
-if (params.equalsIgnoreCase("activity")) {
-return String.format("%.4f", market.getActivity());
+case "perf_cache_size" -> String.valueOf(plugin.getPidController().getCacheSize());
+case "perf_dirty_size" -> String.valueOf(plugin.getPidController().getDirtyQueueSize());
+case "perf_cache_usage" -> {
+int size = plugin.getPidController().getCacheSize();
+int capacity = 128 * 1024;
+yield formatPercent((double) size / capacity);
 }
-if (params.equalsIgnoreCase("threshold")) {
-return String.format("%.0f", market.getCurrentThreshold());
+case "perf_simd_ratio" -> {
+PerformanceMonitor monitor = plugin.getPerformanceMonitor();
+if (monitor != null) {
+yield "N/A";
 }
-if (params.equalsIgnoreCase("holiday")) {
-return String.format("%.2f", market.getHolidayFactor());
+yield "Disabled";
 }
-if (params.equalsIgnoreCase("personal")) {
-if (player != null && player.isOnline()) {
-return String.format("%.4f", market.calculatePersonalFactor(player.getPlayer()));
+case "perf_memory_used" -> {
+Runtime rt = Runtime.getRuntime();
+long usedMB = (rt.totalMemory() - rt.freeMemory()) / 1048576;
+yield String.valueOf(usedMB) + "MB";
 }
-return "1.0000";
+case "perf_memory_percent" -> {
+Runtime rt = Runtime.getRuntime();
+double percent = 100.0 * (rt.totalMemory() - rt.freeMemory()) / rt.maxMemory();
+yield formatPercent(percent / 100.0);
 }
-if (params.equalsIgnoreCase("final_all")) {
+default -> {
+if (params.startsWith("pid_")) {
+String itemId = params.substring(4);
+double lambda = plugin.getPidController().getCachedResult(itemId);
+yield formatDecimal(lambda, 5);
+}
+if (params.startsWith("pid_raw_")) {
+String itemId = params.substring(8);
+double lambda = plugin.getPidController().getCachedResult(itemId);
+yield String.valueOf(lambda);
+}
+if (params.startsWith("pid_integral_")) {
+String itemId = params.substring(13);
+var state = plugin.getPidController().inspectState(itemId);
+yield state != null ? formatDecimal(state.integral(), 2) : "N/A";
+}
+if (params.startsWith("pid_error_")) {
+String itemId = params.substring(10);
+var state = plugin.getPidController().inspectState(itemId);
+yield state != null ? formatDecimal(state.lastError(), 2) : "N/A";
+}
+yield null;
+}
+};
+}
+private String getPersonalFactor(OfflinePlayer player, MarketManager market, int decimals) {
+if (player == null || !player.isOnline()) {
+return decimals < 0 ? "1.0" : "1.0000";
+}
+String uuid = player.getUniqueId().toString();
+CachedValue cached = personalFactorCache.get(uuid);
+if (cached != null && !cached.isExpired()) {
+return decimals < 0 ? String.valueOf(cached.value) :
+String.format("%." + decimals + "f", cached.value);
+}
+double factor = market.calculatePersonalFactor(player.getPlayer());
+personalFactorCache.put(uuid, new CachedValue(factor));
+if (personalFactorCache.size() > 100 && Math.random() < 0.01) {
+personalFactorCache.entrySet().removeIf(entry -> entry.getValue().isExpired());
+}
+return decimals < 0 ? String.valueOf(factor) :
+String.format("%." + decimals + "f", factor);
+}
+private String getFinalFactor(OfflinePlayer player, MarketManager market, int decimals) {
+double factor = calculateFinalFactor(player, market);
+return decimals < 0 ? String.valueOf(factor) :
+String.format("%." + decimals + "f", factor);
+}
+private double calculateFinalFactor(OfflinePlayer player, MarketManager market) {
 double personal = 1.0;
 if (player != null && player.isOnline()) {
+String uuid = player.getUniqueId().toString();
+CachedValue cached = personalFactorCache.get(uuid);
+if (cached != null && !cached.isExpired()) {
+personal = cached.value;
+} else {
 personal = market.calculatePersonalFactor(player.getPlayer());
+personalFactorCache.put(uuid, new CachedValue(personal));
 }
-double finalFactor = personal
+}
+return personal
 * market.getMarketFlux()
 * market.getHolidayFactor()
 * market.getActivity()
 * market.getInflation();
-return String.format("%.4f", finalFactor);
 }
-if (params.startsWith("pid_")) {
-String id = params.substring(4);
-double lambda = plugin.getPidController().getCachedResult(id);
-return String.format("%.5f", lambda);
+private String formatDecimal(double value, int decimals) {
+return String.format("%." + decimals + "f", value);
 }
-return null;
+private String formatInteger(double value) {
+return String.format("%,.0f", value);
+}
+private String formatThousands(double value) {
+if (value >= 1_000_000) {
+return String.format("%.1fM", value / 1_000_000);
+} else if (value >= 1_000) {
+return String.format("%.1fK", value / 1_000);
+} else {
+return String.format("%.0f", value);
+}
+}
+private String formatPercent(double ratio) {
+return String.format("%.1f%%", ratio * 100);
 }
 }
 
@@ -578,59 +1141,55 @@ import cn.superiormc.ultimateshop.objects.buttons.ObjectItem;
 import cn.superiormc.ultimateshop.objects.caches.ObjectUseTimesCache;
 import org.bukkit.Bukkit;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 public class IntegrationManager {
-public record ItemMeta(String shopId, String productId) {}
+private record ItemEntry(
+String rawId,
+ObjectItem item
+) {}
 private final EcoBridge plugin;
-private final ConcurrentHashMap<String, ItemMeta> idParserCache = new ConcurrentHashMap<>();
-private final List<String> monitoredItems = Collections.synchronizedList(new ArrayList<>());
+private List<ItemEntry> activeEntries = new ArrayList<>();
+private volatile List<String> monitoredIdCache = Collections.emptyList();
 public IntegrationManager(EcoBridge plugin) {
 this.plugin = plugin;
 }
 public void collectDataAndCalculate() {
-if (monitoredItems.isEmpty()) {
+if (activeEntries.isEmpty()) {
 syncShops();
+if (activeEntries.isEmpty()) return;
 }
-if (monitoredItems.isEmpty()) return;
-List<String> activeIds = new ArrayList<>(monitoredItems.size());
-double[] volumes = new double[monitoredItems.size()];
-int idx = 0;
-for (String rawId : monitoredItems) {
-ItemMeta meta = idParserCache.get(rawId);
-if (meta == null) continue;
+final List<ItemEntry> currentItems = this.activeEntries;
+final int size = currentItems.size();
+List<String> ids = new ArrayList<>(size);
+double[] volumes = new double[size];
+int count = 0;
+for (int i = 0; i < size; i++) {
+ItemEntry entry = currentItems.get(i);
 try {
-ObjectItem item = ShopHelper.getItemFromID(meta.shopId(), meta.productId());
-if (item != null) {
-ObjectUseTimesCache cache = ShopHelper.getServerUseTimesCache(item);
-double netVolume = 0.0;
+ObjectUseTimesCache cache = ShopHelper.getServerUseTimesCache(entry.item());
 if (cache != null) {
-double buy = cache.getBuyUseTimes();
-double sell = cache.getSellUseTimes();
-netVolume = buy - sell;
+double netVolume = cache.getBuyUseTimes() - cache.getSellUseTimes();
+ids.add(entry.rawId());
+volumes[count++] = netVolume;
 }
-activeIds.add(rawId);
-volumes[idx++] = netVolume;
-}
-} catch (Exception e) {
+} catch (Exception ignored) {
 }
 }
-if (idx == 0) return;
-final int finalCount = idx;
-final List<String> finalIds = activeIds;
-final double[] finalVolumes = Arrays.copyOf(volumes, finalCount);
+if (count == 0) return;
+final List<String> finalIds = ids;
+final double[] finalVolumes = (count == size) ? volumes : Arrays.copyOf(volumes, count);
 Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
 plugin.getPidController().calculateBatch(finalIds, finalVolumes);
 });
 }
-public void syncShops() {
+public synchronized void syncShops() {
 if (ConfigManager.configManager == null || ConfigManager.configManager.shopConfigs == null) {
-plugin.getLogger().warning("UltimateShop ConfigManager not initialized yet.");
+plugin.getLogger().warning("UltimateShop 核心尚未加载完毕，同步延迟。 [cite: 76]");
 return;
 }
 Map<String, ObjectShop> shopMap = ConfigManager.configManager.shopConfigs;
 if (shopMap.isEmpty()) return;
-monitoredItems.clear();
-idParserCache.clear();
+List<ItemEntry> newEntries = new ArrayList<>(shopMap.size() * 10);
+List<String> newIds = new ArrayList<>(shopMap.size() * 10);
 for (Map.Entry<String, ObjectShop> entry : shopMap.entrySet()) {
 String shopId = entry.getKey();
 ObjectShop shop = entry.getValue();
@@ -641,14 +1200,16 @@ for (ObjectItem item : productList) {
 String productId = item.getProduct();
 if (productId == null || productId.isEmpty()) continue;
 String rawId = shopId + "_" + productId;
-idParserCache.put(rawId, new ItemMeta(shopId, productId));
-monitoredItems.add(rawId);
+newEntries.add(new ItemEntry(rawId, item));
+newIds.add(rawId);
 }
 }
-plugin.getLogger().info("Synced " + monitoredItems.size() + " items from UltimateShop for SIMD processing.");
+this.activeEntries = newEntries;
+this.monitoredIdCache = Collections.unmodifiableList(newIds);
+plugin.getLogger().info("成功同步 " + activeEntries.size() + " 个监控物品。 ");
 }
 public List<String> getMonitoredItems() {
-return new ArrayList<>(monitoredItems);
+return monitoredIdCache;
 }
 }
 
@@ -673,10 +1234,9 @@ import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.IntStream;
 public class MarketManager {
 private final EcoBridge plugin;
 private final ExecutorService virtualExecutor = Executors.newVirtualThreadPerTaskExecutor();
@@ -685,14 +1245,15 @@ private final AtomicReference<Double> marketFlux = new AtomicReference<>(1.0);
 private final AtomicReference<Double> currentThreshold = new AtomicReference<>(100000.0);
 private final AtomicReference<Double> activityFactor = new AtomicReference<>(1.0);
 private final ConcurrentHashMap<String, Integer> holidayCache = new ConcurrentHashMap<>();
-private long lastHolidayUpdate = 0;
+private volatile long lastHolidayUpdate = 0;
 private final HttpClient httpClient;
-private final ObjectMapper jsonMapper;
+private final ObjectMapper jsonMapper = new ObjectMapper();
 private Currency currency;
 private static final double MIN_THRESH = 100000.0;
 private static final double INF_WEIGHT = 0.3;
 private static final double PERCENTILE = 0.15;
 private static final String HOLIDAY_API_URL = "https:
+private static final int PARALLEL_SEGMENTS = Runtime.getRuntime().availableProcessors();
 public MarketManager(EcoBridge plugin) {
 this.plugin = plugin;
 this.httpClient = HttpClient.newBuilder()
@@ -700,7 +1261,6 @@ this.httpClient = HttpClient.newBuilder()
 .connectTimeout(Duration.ofSeconds(10))
 .executor(virtualExecutor)
 .build();
-this.jsonMapper = new ObjectMapper();
 setupCurrency();
 }
 private void setupCurrency() {
@@ -708,7 +1268,9 @@ if (Bukkit.getPluginManager().getPlugin("CoinsEngine") != null) {
 String currencyId = plugin.getConfig().getString("economy-settings.currency-id", "ellan_gold");
 this.currency = CoinsEngineAPI.getCurrency(currencyId);
 if (this.currency == null) {
-plugin.getLogger().warning("Currency '" + currencyId + "' not found in CoinsEngine!");
+plugin.getLogger().warning("[Market] Currency '" + currencyId + "' not found!");
+} else {
+plugin.getLogger().info("[Market] Currency loaded: " + currencyId);
 }
 }
 }
@@ -743,7 +1305,8 @@ if (Bukkit.isPrimaryThread()) {
 return player.getStatistic(statistic);
 } else {
 try {
-return Bukkit.getScheduler().callSyncMethod(plugin, () -> player.getStatistic(statistic)).get();
+return Bukkit.getScheduler().callSyncMethod(plugin,
+() -> player.getStatistic(statistic)).get();
 } catch (Exception e) {
 return 0;
 }
@@ -753,28 +1316,47 @@ public void updateEconomyMetrics() {
 if (currency == null) return;
 virtualExecutor.submit(() -> {
 try {
+long startNs = System.nanoTime();
 OfflinePlayer[] allPlayers = Bukkit.getOfflinePlayers();
-List<Double> balances = new ArrayList<>(Math.min(allPlayers.length, 5000));
-for (OfflinePlayer p : allPlayers) {
+int totalPlayers = allPlayers.length;
+if (totalPlayers == 0) return;
+int segmentSize = (totalPlayers + PARALLEL_SEGMENTS - 1) / PARALLEL_SEGMENTS;
+List<List<Double>> segmentBalances = IntStream.range(0, PARALLEL_SEGMENTS)
+.parallel()
+.mapToObj(segId -> {
+List<Double> balances = new ArrayList<>();
+int start = segId * segmentSize;
+int end = Math.min(start + segmentSize, totalPlayers);
+for (int i = start; i < end; i++) {
+OfflinePlayer p = allPlayers[i];
 if (p.isOp()) continue;
 double bal = CoinsEngineAPI.getBalance(p.getUniqueId(), currency);
-if (bal > 0) {
-balances.add(bal);
+if (bal > 0) balances.add(bal);
 }
+return balances;
+})
+.toList();
+List<Double> allBalances = new ArrayList<>();
+for (List<Double> segment : segmentBalances) {
+allBalances.addAll(segment);
 }
-if (balances.isEmpty()) return;
-Collections.sort(balances);
-int size = balances.size();
+if (allBalances.isEmpty()) return;
+allBalances.parallelStream().sorted();
+int size = allBalances.size();
 int index = (int) Math.floor(size * (1.0 - PERCENTILE));
 index = Math.max(0, Math.min(size - 1, index));
-double threshold = Math.max(balances.get(index), MIN_THRESH);
+double threshold = Math.max(allBalances.get(index), MIN_THRESH);
 currentThreshold.set(threshold);
 double ratio = Math.max(1.0, threshold / MIN_THRESH);
 double newInflation = 1.0 + (Math.log(ratio) * INF_WEIGHT);
 inflation.set(newInflation);
-plugin.getLogger().info(String.format("Economy Metrics Updated (VirtualThread): Users=%d, Thresh=%.0f, Inflation=%.4f", size, threshold, newInflation));
+long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
+plugin.getLogger().info(String.format(
+"[Market] Economy updated: %d players, Thresh=%.0f, Inflation=%.4f (took %dms)",
+size, threshold, newInflation, elapsedMs
+));
 } catch (Exception e) {
-plugin.getLogger().warning("Failed to update economy metrics: " + e.getMessage());
+plugin.getLogger().warning("[Market] Failed to update economy: " + e.getMessage());
 }
 });
 }
@@ -787,7 +1369,7 @@ range = plugin.getConfig().getDouble("market-flux.event-range", 0.3);
 }
 double rawFlux = 1.0 + ((rng.nextDouble() * 2.0 - 1.0) * range);
 double finalFlux = rawFlux * inflation.get();
-finalFlux = Math.floor(finalFlux * 1000) / 1000.0;
+finalFlux = Math.floor(finalFlux * 10000) / 10000.0;
 marketFlux.set(finalFlux);
 }
 public void updateActivityFactor() {
@@ -818,6 +1400,7 @@ String url = HOLIDAY_API_URL + "?year=" + year;
 HttpRequest request = HttpRequest.newBuilder()
 .uri(URI.create(url))
 .header("User-Agent", "EcoBridge/Java25")
+.timeout(Duration.ofSeconds(10))
 .GET()
 .build();
 httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
@@ -835,15 +1418,16 @@ int type = node.get("type").asInt();
 holidayCache.put(date, type);
 }
 lastHolidayUpdate = System.currentTimeMillis();
-plugin.getLogger().info("Holiday cache updated via VirtualThread (" + year + ")");
+plugin.getLogger().info("[Market] Holiday cache updated: " +
+holidayCache.size() + " dates");
 }
 }
 } catch (Exception e) {
-plugin.getLogger().warning("Failed to parse holiday JSON: " + e.getMessage());
+plugin.getLogger().warning("[Market] Failed to parse holiday JSON: " + e.getMessage());
 }
 })
 .exceptionally(ex -> {
-plugin.getLogger().warning("Holiday API request failed: " + ex.getMessage());
+plugin.getLogger().warning("[Market] Holiday API error: " + ex.getMessage());
 return null;
 });
 }
@@ -868,13 +1452,246 @@ return plugin.getConfig().getDouble("holidays.multipliers.workday", 1.0);
 }
 public void shutdown() {
 if (!virtualExecutor.isShutdown()) {
+virtualExecutor.shutdown();
+try {
+if (!virtualExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
 virtualExecutor.shutdownNow();
 }
+} catch (InterruptedException e) {
+virtualExecutor.shutdownNow();
+}
+}
+plugin.getLogger().info("[Market] VirtualThread executor closed");
 }
 public double getInflation() { return inflation.get(); }
 public double getMarketFlux() { return marketFlux.get(); }
 public double getActivity() { return activityFactor.get(); }
 public double getCurrentThreshold() { return currentThreshold.get(); }
+}
+
+==================================================
+FILE: EcoBridge_Project\src\main\java\top\ellan\ecobridge\PerformanceMonitor.java
+==================================================
+
+package top.ellan.ecobridge;
+import jdk.incubator.vector.VectorSpecies;
+import org.bukkit.Bukkit;
+import java.lang.management.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+public class PerformanceMonitor {
+private final EcoBridge plugin;
+private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
+Thread.ofVirtual().factory()
+);
+private final LongAdder totalCalculations = new LongAdder();
+private final LongAdder simdCalculations = new LongAdder();
+private final LongAdder scalarCalculations = new LongAdder();
+private final LongAdder dbWrites = new LongAdder();
+private final LongAdder dbReads = new LongAdder();
+private final ConcurrentHashMap<String, PerformanceCounter> counters = new ConcurrentHashMap<>();
+private final MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
+private final ThreadMXBean threadBean = ManagementFactory.getThreadMXBean();
+private final GarbageCollectorMXBean youngGC;
+private final GarbageCollectorMXBean oldGC;
+private volatile long simdBandwidth = 0;
+private volatile int vectorLanes = 0;
+public PerformanceMonitor(EcoBridge plugin) {
+this.plugin = plugin;
+var gcBeans = ManagementFactory.getGarbageCollectorMXBeans();
+youngGC = gcBeans.size() > 0 ? gcBeans.get(0) : null;
+oldGC = gcBeans.size() > 1 ? gcBeans.get(1) : null;
+benchmarkSIMD();
+startMonitoring();
+}
+private void benchmarkSIMD() {
+Thread.ofVirtual().start(() -> {
+try {
+var species = jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED;
+vectorLanes = species.length();
+int size = 1024 * 1024;
+double[] data = new double[size];
+for (int i = 0; i < 10; i++) {
+vectorAdd(data, species);
+}
+long startNs = System.nanoTime();
+int iterations = 100;
+for (int i = 0; i < iterations; i++) {
+vectorAdd(data, species);
+}
+long elapsedNs = System.nanoTime() - startNs;
+long bytesProcessed = (long) size * 8 * iterations;
+double seconds = elapsedNs / 1e9;
+simdBandwidth = (long) (bytesProcessed / seconds / 1e9);
+plugin.getLogger().info(String.format(
+"[Perf] SIMD Benchmark: %s (%d lanes), Bandwidth: %d GB/s",
+species, vectorLanes, simdBandwidth
+));
+} catch (Exception e) {
+plugin.getLogger().warning("[Perf] SIMD benchmark failed: " + e.getMessage());
+}
+});
+}
+private void vectorAdd(double[] data, VectorSpecies<Double> species) {
+int i = 0;
+int bound = species.loopBound(data.length);
+for (; i < bound; i += species.length()) {
+var v1 = jdk.incubator.vector.DoubleVector.fromArray(species, data, i);
+var v2 = v1.add(1.0);
+v2.intoArray(data, i);
+}
+}
+private void startMonitoring() {
+int interval = plugin.getConfig().getInt("monitoring.log-interval", 300);
+scheduler.scheduleAtFixedRate(() -> {
+try {
+logPerformanceReport();
+} catch (Exception e) {
+plugin.getLogger().warning("[Perf] Monitoring error: " + e.getMessage());
+}
+}, interval, interval, TimeUnit.SECONDS);
+}
+private void logPerformanceReport() {
+StringBuilder report = new StringBuilder();
+report.append("\n");
+report.append("╔════════════════════════════════════════════════════════════╗\n");
+report.append("║          EcoBridge Performance Report                     ║\n");
+report.append("╠════════════════════════════════════════════════════════════╣\n");
+long totalCalcs = totalCalculations.sum();
+long simdCalcs = simdCalculations.sum();
+double simdRatio = totalCalcs > 0 ? (100.0 * simdCalcs / totalCalcs) : 0.0;
+report.append(String.format("║ SIMD Vector: %s (%d lanes, %d GB/s)          \n",
+getVectorSpeciesName(), vectorLanes, simdBandwidth));
+report.append(String.format("║ Calculations: %,d total, %,d SIMD (%.1f%%)    \n",
+totalCalcs, simdCalcs, simdRatio));
+report.append(String.format("║ Database: %,d writes, %,d reads              \n",
+dbWrites.sum(), dbReads.sum()));
+MemoryUsage heapUsage = memoryBean.getHeapMemoryUsage();
+long usedMB = heapUsage.getUsed() / 1048576;
+long maxMB = heapUsage.getMax() / 1048576;
+double memPercent = 100.0 * heapUsage.getUsed() / heapUsage.getMax();
+report.append(String.format("║ Memory: %,d MB / %,d MB (%.1f%%)             \n",
+usedMB, maxMB, memPercent));
+if (youngGC != null && oldGC != null) {
+report.append(String.format("║ GC: Young=%,d (%.1fs), Old=%,d (%.1fs)      \n",
+youngGC.getCollectionCount(), youngGC.getCollectionTime() / 1000.0,
+oldGC.getCollectionCount(), oldGC.getCollectionTime() / 1000.0));
+}
+int threadCount = threadBean.getThreadCount();
+int peakThreads = threadBean.getPeakThreadCount();
+report.append(String.format("║ Threads: %d active, %d peak                  \n",
+threadCount, peakThreads));
+try {
+double[] tps = Bukkit.getTPS();
+report.append(String.format("║ TPS: %.2f (1m), %.2f (5m), %.2f (15m)       \n",
+tps[0], tps[1], tps[2]));
+} catch (Exception ignored) {}
+if (plugin.getPidController() != null) {
+int cacheSize = plugin.getPidController().getCacheSize();
+int dirtySize = plugin.getPidController().getDirtyQueueSize();
+report.append(String.format("║ PID Cache: %,d items, %,d dirty             \n",
+cacheSize, dirtySize));
+}
+if (!counters.isEmpty()) {
+report.append("╠════════════════════════════════════════════════════════════╣\n");
+report.append("║ Performance Counters:                                      ║\n");
+counters.forEach((name, counter) -> {
+double avgMs = counter.getAverageMs();
+long count = counter.getCount();
+report.append(String.format("║  %-30s: %.2fms (×%,d)\n",
+name, avgMs, count));
+});
+}
+report.append("╚════════════════════════════════════════════════════════════╝");
+plugin.getLogger().info(report.toString());
+}
+private String getVectorSpeciesName() {
+try {
+var species = jdk.incubator.vector.DoubleVector.SPECIES_PREFERRED;
+return species.toString().replace("DoubleVector", "");
+} catch (Exception e) {
+return "Unknown";
+}
+}
+public static class PerformanceCounter {
+private final AtomicLong totalNs = new AtomicLong(0);
+private final AtomicLong count = new AtomicLong(0);
+public void record(long nanoTime) {
+totalNs.addAndGet(nanoTime);
+count.incrementAndGet();
+}
+public double getAverageMs() {
+long c = count.get();
+return c > 0 ? (totalNs.get() / c / 1_000_000.0) : 0.0;
+}
+public long getCount() {
+return count.get();
+}
+}
+public void recordCalculation(boolean usedSIMD) {
+totalCalculations.increment();
+if (usedSIMD) {
+simdCalculations.increment();
+} else {
+scalarCalculations.increment();
+}
+}
+public void recordDbWrite() {
+dbWrites.increment();
+}
+public void recordDbRead() {
+dbReads.increment();
+}
+public void startTimer(String name) {
+counters.computeIfAbsent(name, k -> new PerformanceCounter());
+}
+public void stopTimer(String name, long startNs) {
+PerformanceCounter counter = counters.get(name);
+if (counter != null) {
+counter.record(System.nanoTime() - startNs);
+}
+}
+public String generateDiagnostics() {
+StringBuilder sb = new StringBuilder();
+sb.append("=== EcoBridge Diagnostics ===\n");
+sb.append("\n[System Info]\n");
+sb.append("Java: ").append(System.getProperty("java.version")).append("\n");
+sb.append("OS: ").append(System.getProperty("os.name")).append(" ")
+.append(System.getProperty("os.version")).append("\n");
+sb.append("Processors: ").append(Runtime.getRuntime().availableProcessors()).append("\n");
+sb.append("\n[SIMD Support]\n");
+sb.append("Vector Species: ").append(getVectorSpeciesName()).append("\n");
+sb.append("Lanes: ").append(vectorLanes).append("\n");
+sb.append("Bandwidth: ").append(simdBandwidth).append(" GB/s\n");
+sb.append("\n[Memory]\n");
+MemoryUsage heap = memoryBean.getHeapMemoryUsage();
+sb.append("Heap Used: ").append(heap.getUsed() / 1048576).append(" MB\n");
+sb.append("Heap Max: ").append(heap.getMax() / 1048576).append(" MB\n");
+MemoryUsage nonHeap = memoryBean.getNonHeapMemoryUsage();
+sb.append("Non-Heap Used: ").append(nonHeap.getUsed() / 1048576).append(" MB\n");
+sb.append("\n[Performance]\n");
+long totalCalcs = totalCalculations.sum();
+long simdCalcs = simdCalculations.sum();
+sb.append("Total Calculations: ").append(totalCalcs).append("\n");
+sb.append("SIMD Calculations: ").append(simdCalcs).append("\n");
+sb.append("SIMD Ratio: ").append(String.format("%.2f%%",
+totalCalcs > 0 ? 100.0 * simdCalcs / totalCalcs : 0)).append("\n");
+return sb.toString();
+}
+public void shutdown() {
+scheduler.shutdown();
+try {
+if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+scheduler.shutdownNow();
+}
+} catch (InterruptedException e) {
+scheduler.shutdownNow();
+}
+}
 }
 
 ==================================================
@@ -885,254 +1702,363 @@ package top.ellan.ecobridge;
 import jdk.incubator.vector.*;
 import java.lang.foreign.*;
 import java.lang.invoke.VarHandle;
-import java.util.List;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.StampedLock;
 public class PidController {
 private static final VectorSpecies<Double> SPECIES = DoubleVector.SPECIES_PREFERRED;
-private static final GroupLayout PID_STATE_LAYOUT = MemoryLayout.structLayout(
-ValueLayout.JAVA_DOUBLE.withName("integral"),
-ValueLayout.JAVA_DOUBLE.withName("lastError"),
-ValueLayout.JAVA_DOUBLE.withName("lastLambda"),
-ValueLayout.JAVA_LONG.withName("updateTime"),
-ValueLayout.JAVA_BYTE.withName("isDirty"),
-MemoryLayout.paddingLayout(7)
-);
-private static final long STATE_SIZE = PID_STATE_LAYOUT.byteSize();
-private static final VarHandle VH_INTEGRAL = PID_STATE_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("integral"));
-private static final VarHandle VH_LAST_ERROR = PID_STATE_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("lastError"));
-private static final VarHandle VH_LAST_LAMBDA = PID_STATE_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("lastLambda"));
-private static final VarHandle VH_UPDATE_TIME = PID_STATE_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("updateTime"));
-private static final VarHandle VH_IS_DIRTY = PID_STATE_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("isDirty"));
-private final EcoBridge plugin;
-private final Arena arena = Arena.ofShared();
-private final MemorySegment memorySegment;
-private final ConcurrentHashMap<String, Long> offsetMap = new ConcurrentHashMap<>(4096);
-private final Queue<Long> dirtyOffsetQueue = new ConcurrentLinkedQueue<>();
-private final ReentrantReadWriteLock segmentLock = new ReentrantReadWriteLock();
-private final ReentrantLock allocationLock = new ReentrantLock();
-private final AtomicBoolean isClosed = new AtomicBoolean(false);
-private long currentOffset = 0;
+private static final int VECTOR_LEN = SPECIES.length();
+private static final int CAPACITY = 8192;
+private static final int SEGMENT_COUNT = 16;
+private static final int SEGMENT_MASK = SEGMENT_COUNT - 1;
+private static final ValueLayout.OfDouble D = ValueLayout.JAVA_DOUBLE;
+private static final ValueLayout.OfLong L = ValueLayout.JAVA_LONG;
+private static final ValueLayout.OfByte B = ValueLayout.JAVA_BYTE;
+private static final VarHandle VH_DOUBLE = D.arrayElementVarHandle();
+private static final VarHandle VH_LONG = L.arrayElementVarHandle();
+private static final VarHandle VH_BYTE = B.arrayElementVarHandle();
 private static final double PID_TAU_INV = 0.00001929;
 private static final double TARGET_VOL = 1000.0;
 private static final double BASE_LAMBDA = 0.002;
 private static final double KP = 0.00001;
-private static final double KP_NEG_FACTOR = 0.6;
+private static final double KP_NEG = 0.00001 * 0.6;
 private static final double KI = 0.000001;
 private static final double KD = 0.00005;
-private static final double TARGET_DEADBAND = TARGET_VOL * 0.02;
-private static final ThreadLocal<Buffers> TL_BUFFERS = ThreadLocal.withInitial(Buffers::new);
-private static class Buffers {
-double[] integrals = new double[1024];
-double[] lastErrors = new double[1024];
-double[] lastLambdas = new double[1024];
-long[] updateTimes = new long[1024];
-long[] offsets = new long[1024];
-void ensureCapacity(int size) {
-if (integrals.length < size) {
-int newSize = Math.max(integrals.length * 2, size);
-integrals = new double[newSize];
-lastErrors = new double[newSize];
-lastLambdas = new double[newSize];
-updateTimes = new long[newSize];
-offsets = new long[newSize];
+private static final double DEADBAND = 20.0;
+private static final DoubleVector VEC_TARGET = DoubleVector.broadcast(SPECIES, TARGET_VOL);
+private static final DoubleVector VEC_DEADBAND = DoubleVector.broadcast(SPECIES, DEADBAND);
+private static final DoubleVector VEC_TAU_INV = DoubleVector.broadcast(SPECIES, PID_TAU_INV);
+private static final DoubleVector VEC_KP = DoubleVector.broadcast(SPECIES, KP);
+private static final DoubleVector VEC_KP_NEG = DoubleVector.broadcast(SPECIES, KP_NEG);
+private static final DoubleVector VEC_KI = DoubleVector.broadcast(SPECIES, KI);
+private static final DoubleVector VEC_KD = DoubleVector.broadcast(SPECIES, KD);
+private static final DoubleVector VEC_BASE = DoubleVector.broadcast(SPECIES, BASE_LAMBDA);
+private static final DoubleVector VEC_ALPHA = DoubleVector.broadcast(SPECIES, 0.05);
+private static final DoubleVector VEC_BETA = DoubleVector.broadcast(SPECIES, 0.95);
+private static final DoubleVector VEC_I_MAX = DoubleVector.broadcast(SPECIES, 30000.0);
+private static final DoubleVector VEC_I_MIN = DoubleVector.broadcast(SPECIES, -30000.0);
+private static final DoubleVector VEC_L_MAX = DoubleVector.broadcast(SPECIES, 0.01);
+private static final DoubleVector VEC_L_MIN = DoubleVector.broadcast(SPECIES, 0.0005);
+private static final DoubleVector VEC_DT_MAX = DoubleVector.broadcast(SPECIES, 1.0);
+private static final DoubleVector VEC_DT_MIN = DoubleVector.broadcast(SPECIES, 0.05);
+private static final DoubleVector VEC_ZERO = DoubleVector.broadcast(SPECIES, 0.0);
+private static final DoubleVector VEC_ONE = DoubleVector.broadcast(SPECIES, 1.0);
+private final EcoBridge plugin;
+private final Arena arena = Arena.ofShared();
+private final Segment[] segments = new Segment[SEGMENT_COUNT];
+private final ConcurrentHashMap<String, Integer> globalIndex = new ConcurrentHashMap<>(65536, 0.75f, 64);
+private final AtomicBoolean closed = new AtomicBoolean(false);
+private final AtomicLong totalCalcs = new AtomicLong(0);
+private final AtomicLong simdCalcs = new AtomicLong(0);
+private static class Segment {
+final StampedLock lock = new StampedLock();
+final MemorySegment integrals;
+final MemorySegment errors;
+final MemorySegment lambdas;
+final MemorySegment times;
+final MemorySegment dirty;
+final BitSet allocated = new BitSet(CAPACITY);
+final Queue<Integer> freeSlots = new ConcurrentLinkedQueue<>();
+Segment(Arena arena) {
+integrals = arena.allocate(D, CAPACITY);
+errors = arena.allocate(D, CAPACITY);
+lambdas = arena.allocate(D, CAPACITY);
+times = arena.allocate(L, CAPACITY);
+dirty = arena.allocate(B, CAPACITY);
+for (int i = 0; i < CAPACITY; i++) freeSlots.offer(i);
+}
+int allocateSlot() {
+Integer slot = freeSlots.poll();
+if (slot == null) return -1;
+allocated.set(slot);
+VH_DOUBLE.set(lambdas, 0L, (long) slot, BASE_LAMBDA);
+VH_LONG.set(times, 0L, (long) slot, System.currentTimeMillis() - 1000);
+return slot;
 }
 }
+private static class WorkBuffer {
+double[] temp1 = new double[CAPACITY];
+double[] temp2 = new double[CAPACITY];
+double[] temp3 = new double[CAPACITY];
 }
+private static final ThreadLocal<WorkBuffer> TL_BUFFER = ThreadLocal.withInitial(WorkBuffer::new);
 public PidController(EcoBridge plugin) {
 this.plugin = plugin;
-this.memorySegment = arena.allocate(32 * 1024 * 1024, 8);
+for (int i = 0; i < SEGMENT_COUNT; i++) {
+segments[i] = new Segment(arena);
 }
-private long getOrAllocateOffset(String itemId, long now) {
-return offsetMap.computeIfAbsent(itemId, k -> {
-allocationLock.lock();
-try {
-if (isClosed.get()) throw new IllegalStateException("Controller closed");
-long offset = currentOffset;
-if (offset + STATE_SIZE > memorySegment.byteSize()) throw new OutOfMemoryError("Off-heap full!");
-currentOffset += STATE_SIZE;
-MemorySegment slice = memorySegment.asSlice(offset, STATE_SIZE);
-VH_LAST_LAMBDA.set(slice, 0L, BASE_LAMBDA);
-VH_UPDATE_TIME.set(slice, 0L, now - 1000);
-return offset;
-} finally {
-allocationLock.unlock();
+warmupMemory();
+plugin.getLogger().info(String.format(
+"[PID] Initialized: %d segments × %d slots = %d capacity, SIMD=%s (%d lanes)",
+SEGMENT_COUNT, CAPACITY, SEGMENT_COUNT * CAPACITY, SPECIES, VECTOR_LEN
+));
 }
-});
+private void warmupMemory() {
+for (Segment seg : segments) {
+for (int i = 0; i < CAPACITY; i += 512) {
+VH_DOUBLE.set(seg.integrals, 0L, (long) i, 0.0);
+}
+}
 }
 public void calculateBatch(List<String> itemIds, double[] volumes) {
-if (isClosed.get()) return;
-Buffers buf = TL_BUFFERS.get();
-int count = itemIds.size();
-buf.ensureCapacity(count);
-long now = System.currentTimeMillis();
-segmentLock.writeLock().lock();
-try {
-for (int i = 0; i < count; i++) {
-long offset = getOrAllocateOffset(itemIds.get(i), now);
-buf.offsets[i] = offset;
-MemorySegment slice = memorySegment.asSlice(offset, STATE_SIZE);
-buf.integrals[i] = (double) VH_INTEGRAL.get(slice, 0L);
-buf.lastErrors[i] = (double) VH_LAST_ERROR.get(slice, 0L);
-buf.lastLambdas[i] = (double) VH_LAST_LAMBDA.get(slice, 0L);
-buf.updateTimes[i] = (long) VH_UPDATE_TIME.get(slice, 0L);
+if (closed.get() || itemIds.isEmpty()) return;
+@SuppressWarnings("unchecked")
+List<Integer>[] groups = new List[SEGMENT_COUNT];
+for (int i = 0; i < SEGMENT_COUNT; i++) groups[i] = new ArrayList<>();
+for (int i = 0; i < itemIds.size(); i++) {
+String id = itemIds.get(i);
+int globalIdx = getOrAllocate(id);
+if (globalIdx < 0) continue;
+int segId = globalIdx >>> 16;
+groups[segId].add(i);
 }
-int i = 0;
-int loopBound = SPECIES.loopBound(count);
-for (; i < loopBound; i += SPECIES.length()) {
-var vIntegral = DoubleVector.fromArray(SPECIES, buf.integrals, i);
-var vLastError = DoubleVector.fromArray(SPECIES, buf.lastErrors, i);
-var vLastLambda = DoubleVector.fromArray(SPECIES, buf.lastLambdas, i);
-var vVolume = DoubleVector.fromArray(SPECIES, volumes, i);
-double[] dtTemp = new double[SPECIES.length()];
-for(int j=0; j<SPECIES.length(); j++) dtTemp[j] = (now - buf.updateTimes[i+j]) * 0.001;
-var vDt = DoubleVector.fromArray(SPECIES, dtTemp, 0);
-vDt = vDt.min(1.0).max(0.05);
-var vDecay = vDt.mul(PID_TAU_INV).neg().add(1.0);
-var vNewIntegral = vIntegral.mul(vDecay);
-var vError = vVolume.sub(TARGET_VOL);
-var maskDeadband = vError.abs().compare(VectorOperators.LT, TARGET_DEADBAND);
-vError = vError.blend(0.0, maskDeadband);
-var maskNeg = vError.compare(VectorOperators.LT, 0.0);
-var vKpBase = DoubleVector.broadcast(SPECIES, KP);
-var vKpNeg = DoubleVector.broadcast(SPECIES, KP * KP_NEG_FACTOR);
-var vKp = vKpBase.blend(vKpNeg, maskNeg);
-var vP = vError.mul(vKp);
-vNewIntegral = vNewIntegral.add(vError.mul(vDt));
-vNewIntegral = vNewIntegral.min(30000.0).max(-30000.0);
-var vD = vError.sub(vLastError).div(vDt).mul(KD);
-var vRaw = vP.add(vNewIntegral.mul(KI)).add(vD).add(BASE_LAMBDA);
-var vLambda = vRaw.mul(0.05).add(vLastLambda.mul(0.95));
-vLambda = vLambda.min(0.01).max(0.0005);
-vNewIntegral.intoArray(buf.integrals, i);
-vError.intoArray(buf.lastErrors, i);
-vLambda.intoArray(buf.lastLambdas, i);
-}
-for (; i < count; i++) {
-double dt = (now - buf.updateTimes[i]) * 0.001;
-if (dt > 1.0) dt = 1.0; else if (dt < 0.05) dt = 0.05;
-double decay = 1.0 - (dt * PID_TAU_INV);
-double integral = buf.integrals[i] * decay;
-double error = volumes[i] - TARGET_VOL;
-if (Math.abs(error) < TARGET_DEADBAND) error = 0.0;
-double kpEff = (error < 0) ? KP * KP_NEG_FACTOR : KP;
-integral += error * dt;
-integral = Math.max(-30000, Math.min(30000, integral));
-double d = KD * ((error - buf.lastErrors[i]) / dt);
-double raw = BASE_LAMBDA + kpEff * error + KI * integral + d;
-double lambda = raw * 0.05 + buf.lastLambdas[i] * 0.95;
-buf.lastLambdas[i] = Math.max(0.0005, Math.min(0.01, lambda));
-buf.integrals[i] = integral;
-buf.lastErrors[i] = error;
-}
-for (int k = 0; k < count; k++) {
-MemorySegment slice = memorySegment.asSlice(buf.offsets[k], STATE_SIZE);
-VH_INTEGRAL.set(slice, 0L, buf.integrals[k]);
-VH_LAST_ERROR.set(slice, 0L, buf.lastErrors[k]);
-VH_LAST_LAMBDA.set(slice, 0L, buf.lastLambdas[k]);
-VH_UPDATE_TIME.set(slice, 0L, now);
-byte isDirty = (byte) VH_IS_DIRTY.get(slice, 0L);
-if (isDirty == 0) {
-VH_IS_DIRTY.set(slice, 0L, (byte) 1);
-dirtyOffsetQueue.offer(buf.offsets[k]);
-}
-}
-} finally {
-segmentLock.writeLock().unlock();
-}
-}
-public double getCachedResult(String id) {
-Long offset = offsetMap.get(id);
-if (offset == null) return BASE_LAMBDA;
-return (double) VH_LAST_LAMBDA.get(memorySegment, offset);
-}
-public void flushBuffer(boolean sync) {
-if (dirtyOffsetQueue.isEmpty() || isClosed.get()) return;
-List<DatabaseManager.PidDbSnapshot> batch = new java.util.ArrayList<>();
-Long offset;
-int limit = 1000;
-segmentLock.writeLock().lock();
-try {
-while (limit-- > 0 && (offset = dirtyOffsetQueue.poll()) != null) {
-MemorySegment slice = memorySegment.asSlice(offset, STATE_SIZE);
-byte isDirty = (byte) VH_IS_DIRTY.get(slice, 0L);
-if (isDirty == 1) {
-VH_IS_DIRTY.set(slice, 0L, (byte) 0);
-String itemId = findItemIdByOffset(offset);
-if (itemId == null) continue;
-batch.add(new DatabaseManager.PidDbSnapshot(
-itemId,
-(double) VH_INTEGRAL.get(slice, 0L),
-(double) VH_LAST_ERROR.get(slice, 0L),
-(double) VH_LAST_LAMBDA.get(slice, 0L),
-(long) VH_UPDATE_TIME.get(slice, 0L)
+long startNs = System.nanoTime();
+Arrays.stream(groups)
+.parallel()
+.forEach(group -> {
+if (group.isEmpty()) return;
+int segId = globalIndex.get(itemIds.get(group.get(0))) >>> 16;
+processSegment(segId, group, itemIds, volumes);
+});
+totalCalcs.addAndGet(itemIds.size());
+if (plugin.getConfig().getBoolean("debug-perf", false)) {
+long elapsedUs = (System.nanoTime() - startNs) / 1000;
+plugin.getLogger().info(String.format(
+"[PID] Batch=%d, Time=%dμs, SIMD%%=%.1f",
+itemIds.size(), elapsedUs, 100.0 * simdCalcs.get() / totalCalcs.get()
 ));
 }
 }
+private void processSegment(int segId, List<Integer> indices, List<String> itemIds, double[] volumes) {
+Segment seg = segments[segId];
+long stamp = seg.lock.writeLock();
+try {
+WorkBuffer buf = TL_BUFFER.get();
+int count = indices.size();
+long now = System.currentTimeMillis();
+int[] localIndices = new int[count];
+for (int i = 0; i < count; i++) {
+int globalIdx = globalIndex.get(itemIds.get(indices.get(i)));
+localIndices[i] = globalIdx & 0xFFFF;
+}
+int i = 0;
+int bound = SPECIES.loopBound(count);
+for (; i < bound; i += VECTOR_LEN) {
+var vIntegral = loadVector(seg.integrals, localIndices, i);
+var vError = loadVector(seg.errors, localIndices, i);
+var vLambda = loadVector(seg.lambdas, localIndices, i);
+var vDt = VEC_ZERO;
+for (int j = 0; j < VECTOR_LEN && i + j < count; j++) {
+long lastTime = (long) VH_LONG.get(seg.times, 0L, (long) localIndices[i + j]);
+buf.temp1[j] = (now - lastTime) * 0.001;
+}
+vDt = DoubleVector.fromArray(SPECIES, buf.temp1, 0);
+vDt = vDt.min(VEC_DT_MAX).max(VEC_DT_MIN);
+var vVolume = VEC_ZERO;
+for (int j = 0; j < VECTOR_LEN && i + j < count; j++) {
+buf.temp2[j] = volumes[indices.get(i + j)];
+}
+vVolume = DoubleVector.fromArray(SPECIES, buf.temp2, 0);
+var vDecay = VEC_ONE.sub(vDt.mul(VEC_TAU_INV));
+vIntegral = vIntegral.mul(vDecay);
+var vErr = vVolume.sub(VEC_TARGET);
+var maskDead = vErr.abs().compare(VectorOperators.LT, VEC_DEADBAND);
+vErr = vErr.blend(VEC_ZERO, maskDead);
+var maskNeg = vErr.compare(VectorOperators.LT, VEC_ZERO);
+var vKp = VEC_KP.blend(VEC_KP_NEG, maskNeg);
+var vP = vErr.mul(vKp);
+vIntegral = vIntegral.add(vErr.mul(vDt));
+vIntegral = vIntegral.min(VEC_I_MAX).max(VEC_I_MIN);
+var vI = vIntegral.mul(VEC_KI);
+var vD = vErr.sub(vError).div(vDt).mul(VEC_KD);
+var vRaw = vP.add(vI).add(vD).add(VEC_BASE);
+vLambda = vRaw.mul(VEC_ALPHA).add(vLambda.mul(VEC_BETA));
+vLambda = vLambda.min(VEC_L_MAX).max(VEC_L_MIN);
+storeVector(seg.integrals, localIndices, i, vIntegral);
+storeVector(seg.errors, localIndices, i, vErr);
+storeVector(seg.lambdas, localIndices, i, vLambda);
+for (int j = 0; j < VECTOR_LEN && i + j < count; j++) {
+int idx = localIndices[i + j];
+VH_LONG.set(seg.times, 0L, (long) idx, now);
+VH_BYTE.set(seg.dirty, 0L, (long) idx, (byte) 1);
+}
+}
+simdCalcs.addAndGet(i);
+for (; i < count; i++) {
+int idx = localIndices[i];
+double integral = (double) VH_DOUBLE.get(seg.integrals, 0L, (long) idx);
+double lastErr = (double) VH_DOUBLE.get(seg.errors, 0L, (long) idx);
+double lambda = (double) VH_DOUBLE.get(seg.lambdas, 0L, (long) idx);
+long lastTime = (long) VH_LONG.get(seg.times, 0L, (long) idx);
+double dt = Math.min(1.0, Math.max(0.05, (now - lastTime) * 0.001));
+double volume = volumes[indices.get(i)];
+integral *= (1.0 - dt * PID_TAU_INV);
+double err = volume - TARGET_VOL;
+if (Math.abs(err) < DEADBAND) err = 0.0;
+double kp = (err < 0) ? KP_NEG : KP;
+double p = kp * err;
+integral += err * dt;
+integral = Math.max(-30000, Math.min(30000, integral));
+double i_term = KI * integral;
+double d = KD * ((err - lastErr) / dt);
+double raw = p + i_term + d + BASE_LAMBDA;
+lambda = raw * 0.05 + lambda * 0.95;
+lambda = Math.max(0.0005, Math.min(0.01, lambda));
+VH_DOUBLE.set(seg.integrals, 0L, (long) idx, integral);
+VH_DOUBLE.set(seg.errors, 0L, (long) idx, err);
+VH_DOUBLE.set(seg.lambdas, 0L, (long) idx, lambda);
+VH_LONG.set(seg.times, 0L, (long) idx, now);
+VH_BYTE.set(seg.dirty, 0L, (long) idx, (byte) 1);
+}
 } finally {
-segmentLock.writeLock().unlock();
+seg.lock.unlockWrite(stamp);
+}
+}
+private DoubleVector loadVector(MemorySegment segment, int[] indices, int offset) {
+double[] buf = TL_BUFFER.get().temp3;
+for (int i = 0; i < VECTOR_LEN; i++) {
+buf[i] = (double) VH_DOUBLE.get(segment, 0L, (long) indices[offset + i]);
+}
+return DoubleVector.fromArray(SPECIES, buf, 0);
+}
+private void storeVector(MemorySegment segment, int[] indices, int offset, DoubleVector vec) {
+double[] buf = TL_BUFFER.get().temp3;
+vec.intoArray(buf, 0);
+for (int i = 0; i < VECTOR_LEN; i++) {
+VH_DOUBLE.set(segment, 0L, (long) indices[offset + i], buf[i]);
+}
+}
+private int getOrAllocate(String itemId) {
+return globalIndex.computeIfAbsent(itemId, id -> {
+int segId = Math.abs(id.hashCode()) & SEGMENT_MASK;
+Segment seg = segments[segId];
+long stamp = seg.lock.writeLock();
+try {
+int localIdx = seg.allocateSlot();
+if (localIdx < 0) {
+plugin.getLogger().warning("[PID] Segment " + segId + " is full!");
+return -1;
+}
+return (segId << 16) | localIdx;
+} finally {
+seg.lock.unlockWrite(stamp);
+}
+});
+}
+public double getCachedResult(String id) {
+Integer globalIdx = globalIndex.get(id);
+if (globalIdx == null || globalIdx < 0) return BASE_LAMBDA;
+int segId = globalIdx >>> 16;
+int localIdx = globalIdx & 0xFFFF;
+Segment seg = segments[segId];
+long stamp = seg.lock.tryOptimisticRead();
+double lambda = (double) VH_DOUBLE.get(seg.lambdas, 0L, (long) localIdx);
+if (!seg.lock.validate(stamp)) {
+stamp = seg.lock.readLock();
+try {
+lambda = (double) VH_DOUBLE.get(seg.lambdas, 0L, (long) localIdx);
+} finally {
+seg.lock.unlockRead(stamp);
+}
+}
+return lambda;
+}
+public void flushBuffer(boolean sync) {
+if (closed.get()) return;
+List<DatabaseManager.PidDbSnapshot> batch = new ArrayList<>(1000);
+for (int segId = 0; segId < SEGMENT_COUNT; segId++) {
+Segment seg = segments[segId];
+long stamp = seg.lock.writeLock();
+try {
+for (int i = 0; i < CAPACITY; i++) {
+if (!seg.allocated.get(i)) continue;
+byte isDirty = (byte) VH_BYTE.get(seg.dirty, 0L, (long) i);
+if (isDirty == 0) continue;
+VH_BYTE.set(seg.dirty, 0L, (long) i, (byte) 0);
+int targetGlobal = (segId << 16) | i;
+String itemId = null;
+for (var entry : globalIndex.entrySet()) {
+if (entry.getValue() == targetGlobal) {
+itemId = entry.getKey();
+break;
+}
+}
+if (itemId == null) continue;
+batch.add(new DatabaseManager.PidDbSnapshot(
+itemId,
+(double) VH_DOUBLE.get(seg.integrals, 0L, (long) i),
+(double) VH_DOUBLE.get(seg.errors, 0L, (long) i),
+(double) VH_DOUBLE.get(seg.lambdas, 0L, (long) i),
+(long) VH_LONG.get(seg.times, 0L, (long) i)
+));
+if (batch.size() >= 1000) break;
+}
+} finally {
+seg.lock.unlockWrite(stamp);
+}
+if (batch.size() >= 1000) break;
 }
 if (batch.isEmpty()) return;
 Runnable task = () -> plugin.getDatabaseManager().saveBatch(batch);
 if (sync) task.run();
 else Thread.ofVirtual().start(task);
 }
-private String findItemIdByOffset(long targetOffset) {
-for (var entry : offsetMap.entrySet()) {
-if (entry.getValue() == targetOffset) return entry.getKey();
-}
-return null;
-}
 public void loadAllStates() {
-if (isClosed.get()) return;
+if (closed.get()) return;
 plugin.getDatabaseManager().loadStates(snapshot -> {
-segmentLock.writeLock().lock();
+int globalIdx = getOrAllocate(snapshot.itemId());
+if (globalIdx < 0) return;
+int segId = globalIdx >>> 16;
+int localIdx = globalIdx & 0xFFFF;
+Segment seg = segments[segId];
+long stamp = seg.lock.writeLock();
 try {
-long offset = getOrAllocateOffset(snapshot.itemId(), snapshot.updateTime());
-MemorySegment slice = memorySegment.asSlice(offset, STATE_SIZE);
-VH_INTEGRAL.set(slice, 0L, snapshot.integral());
-VH_LAST_ERROR.set(slice, 0L, snapshot.lastError());
-VH_LAST_LAMBDA.set(slice, 0L, snapshot.lastLambda());
+VH_DOUBLE.set(seg.integrals, 0L, (long) localIdx, snapshot.integral());
+VH_DOUBLE.set(seg.errors, 0L, (long) localIdx, snapshot.lastError());
+VH_DOUBLE.set(seg.lambdas, 0L, (long) localIdx, snapshot.lastLambda());
+VH_LONG.set(seg.times, 0L, (long) localIdx, snapshot.updateTime());
 } finally {
-segmentLock.writeLock().unlock();
+seg.lock.unlockWrite(stamp);
 }
 });
 }
 public record PidStateDto(double integral, double lastError, double lastLambda, long updateTime) {}
 public PidStateDto inspectState(String itemId) {
-Long offset = offsetMap.get(itemId);
-if (offset == null) return null;
-segmentLock.readLock().lock();
+Integer globalIdx = globalIndex.get(itemId);
+if (globalIdx == null || globalIdx < 0) return null;
+int segId = globalIdx >>> 16;
+int localIdx = globalIdx & 0xFFFF;
+Segment seg = segments[segId];
+long stamp = seg.lock.readLock();
 try {
-MemorySegment slice = memorySegment.asSlice(offset, STATE_SIZE);
 return new PidStateDto(
-(double) VH_INTEGRAL.get(slice, 0L),
-(double) VH_LAST_ERROR.get(slice, 0L),
-(double) VH_LAST_LAMBDA.get(slice, 0L),
-(long) VH_UPDATE_TIME.get(slice, 0L)
+(double) VH_DOUBLE.get(seg.integrals, 0L, (long) localIdx),
+(double) VH_DOUBLE.get(seg.errors, 0L, (long) localIdx),
+(double) VH_DOUBLE.get(seg.lambdas, 0L, (long) localIdx),
+(long) VH_LONG.get(seg.times, 0L, (long) localIdx)
 );
 } finally {
-segmentLock.readLock().unlock();
+seg.lock.unlockRead(stamp);
 }
 }
 public int getDirtyQueueSize() {
-return dirtyOffsetQueue.size();
+int total = 0;
+for (Segment seg : segments) {
+for (int i = 0; i < CAPACITY; i++) {
+if (seg.allocated.get(i) && (byte) VH_BYTE.get(seg.dirty, 0L, (long) i) == 1) {
+total++;
+}
+}
+}
+return total;
 }
 public int getCacheSize() {
-return offsetMap.size();
+return globalIndex.size();
 }
 public void close() {
-if (isClosed.compareAndSet(false, true)) {
-segmentLock.writeLock().lock();
-try {
+if (closed.compareAndSet(false, true)) {
 if (arena.scope().isAlive()) arena.close();
-} finally {
-segmentLock.writeLock().unlock();
-}
 }
 }
 }

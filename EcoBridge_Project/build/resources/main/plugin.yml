@@ -1,0 +1,28 @@
+name: EcoBridge
+version: 1.0-SNAPSHOT
+main: top.ellan.ecobridge.EcoBridge
+api-version: 1.21
+authors: [Ellan]
+website: https://github.com/Ellan/EcoBridge
+
+# [关键修复] 硬依赖列表
+# 你的代码直接引用了这些插件的 API，必须确保它们先加载
+depend:
+  - PlaceholderAPI
+  - CoinsEngine
+  - UltimateShop
+
+# [关键修复] 指令注册
+# 必须与 Java 代码 getCommand("ecobridge") 对应
+commands:
+  ecobridge:
+    description: EcoBridge 经济调控系统核心指令
+    usage: /eb help
+    permission: ecobridge.admin
+    aliases: [eb, eco]
+
+# 权限注册 (可选，但推荐)
+permissions:
+  ecobridge.admin:
+    description: 允许使用重载、调试和数据查看功能
+    default: op
