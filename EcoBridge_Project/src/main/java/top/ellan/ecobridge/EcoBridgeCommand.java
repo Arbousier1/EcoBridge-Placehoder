@@ -18,7 +18,7 @@ import java.util.stream.Collectors;
 /**
  * EcoBridgeCommand - 极限优化版指令处理器
  * * 已修复:
- * 1. 适配 OptimizedPidController 的 handle/inspect 逻辑 [cite: 159-161]
+ * 1. 适配 OptimizedPidController 的 handle/inspect 逻辑
  * 2. 完善了 SIMD 诊断与性能报告生成逻辑
  * 3. 增强了 MiniMessage 视觉反馈
  */
@@ -70,13 +70,13 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
             plugin.getPluginMeta().getVersion());
         msg(sender, "");
         msg(sender, " <yellow>基础维护:");
-        msg(sender, "  <gold>/eb reload <dark_gray>• <gray>热重载配置、商店与市场缓存 [cite: 38]");
-        msg(sender, "  <gold>/eb check [玩家] <dark_gray>• <gray>分析指定玩家的经济因子 [cite: 49]");
-        msg(sender, "  <gold>/eb inspect <ID> <dark_gray>• <gray>实时审查物品 PID 运行数据 [cite: 53]");
-        msg(sender, "  <gold>/eb save <dark_gray>• <gray>强制刷写脏数据至数据库 [cite: 39]");
+        msg(sender, "  <gold>/eb reload <dark_gray>• <gray>热重载配置、商店与市场缓存 ");
+        msg(sender, "  <gold>/eb check [玩家] <dark_gray>• <gray>分析指定玩家的经济因子");
+        msg(sender, "  <gold>/eb inspect <ID> <dark_gray>• <gray>实时审查物品 PID 运行数据");
+        msg(sender, "  <gold>/eb save <dark_gray>• <gray>强制刷写脏数据至数据库");
         msg(sender, "");
         msg(sender, " <yellow>高级诊断:");
-        msg(sender, "  <gold>/eb perf <dark_gray>• <gray>查看内存、TPS 及缓存统计 [cite: 43]");
+        msg(sender, "  <gold>/eb perf <dark_gray>• <gray>查看内存、TPS 及缓存统计");
         msg(sender, "  <gold>/eb simd <dark_gray>• <gray>CPU 向量化指令集兼容性诊断");
         msg(sender, "  <gold>/eb health <dark_gray>• <gray>系统模块健康度自动化检查");
         msg(sender, "  <gold>/eb benchmark <dark_gray>• <gray>执行非线性压力基准测试");
@@ -108,8 +108,8 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
 
         msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         msg(sender, "<gradient:gold:yellow>性能实时监控</gradient>");
-        msg(sender, " <gray>控制器缓存: <aqua>" + plugin.getPidController().getCacheSize() + " <dark_gray>items [cite: 162]");
-        msg(sender, " <gray>待刷写数据: <red>" + plugin.getPidController().getDirtyQueueSize() + " <dark_gray>pending [cite: 161]");
+        msg(sender, " <gray>控制器缓存: <aqua>" + plugin.getPidController().getCacheSize() + " <dark_gray>items");
+        msg(sender, " <gray>待刷写数据: <red>" + plugin.getPidController().getDirtyQueueSize() + " <dark_gray>pending");
         msg(sender, " <gray>TPS (1m): " + (tps > 18 ? "<green>" : "<red>") + String.format("%.2f", tps));
         msg(sender, String.format(" <gray>JVM 内存: <aqua>%.0fMB <dark_gray>/ <gray>%.0fMB", usedMem, maxMem));
         msg(sender, " <gray>活跃线程: <white>" + Thread.activeCount());
@@ -213,7 +213,7 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
             return;
         }
         msg(sender, "<yellow>正在手动刷写 " + dirty + " 条数据...");
-        plugin.getPidController().flushBuffer(true); // 同步刷写 [cite: 24]
+        plugin.getPidController().flushBuffer(true); // 同步刷写
         msg(sender, "<green>数据已安全持久化至数据库。");
     }
 
