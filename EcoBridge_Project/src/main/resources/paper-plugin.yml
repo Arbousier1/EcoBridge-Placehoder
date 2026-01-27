@@ -20,15 +20,6 @@ dependencies:
       load: BEFORE
       required: true
 
-commands:
-  ecobridge:
-    description: "EcoBridge 经济调控系统核心指令"
-    usage: "/eb help"
-    permission: "ecobridge.admin"
-    aliases:
-      - eb
-      - eco
-
 permissions:
   ecobridge.admin:
     description: "允许使用重载、调试和数据查看功能"

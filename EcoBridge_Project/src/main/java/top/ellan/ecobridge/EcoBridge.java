@@ -277,10 +277,23 @@ public class EcoBridge extends JavaPlugin {
     }
 
     private void registerCommands() {
-        if (getCommand("ecobridge") != null) {
+        try {
+            // 创建命令实例
             EcoBridgeCommand cmd = new EcoBridgeCommand(this);
-            getCommand("ecobridge").setExecutor(cmd);
-            getCommand("ecobridge").setTabCompleter(cmd);
+            
+            // 获取服务器的 CommandMap
+            java.lang.reflect.Field commandMapField = Bukkit.getServer().getClass().getDeclaredField("commandMap");
+            commandMapField.setAccessible(true);
+            org.bukkit.command.CommandMap commandMap = (org.bukkit.command.CommandMap) commandMapField.get(Bukkit.getServer());
+            
+            // 注册命令
+            // "ecobridge" 是 fallback prefix，通常设为插件名
+            commandMap.register("ecobridge", cmd);
+            
+            getLogger().info("  ✓ Commands registered (Direct CommandMap Injection)");
+        } catch (Exception e) {
+            getLogger().severe("  ✗ Failed to register commands: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 

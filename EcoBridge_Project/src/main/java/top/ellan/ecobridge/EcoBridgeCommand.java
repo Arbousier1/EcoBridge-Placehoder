@@ -3,34 +3,36 @@ package top.ellan.ecobridge;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.Bukkit;
 import org.bukkit.command.Command;
-import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
-import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
-import org.jetbrains.annotations.Nullable;
+
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Random;
 import java.util.stream.Collectors;
 
-public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
+// [修改] 改为继承 Command，而非实现接口
+public class EcoBridgeCommand extends Command {
     private final EcoBridge plugin;
     private final MiniMessage mm = MiniMessage.miniMessage();
 
     public EcoBridgeCommand(EcoBridge plugin) {
+        // [修改] 调用父类构造函数注册命令名称、描述、用法、别名
+        super("ecobridge", "EcoBridge Core Command", "/eb help", Arrays.asList("eb", "eco"));
         this.plugin = plugin;
+        this.setPermission("ecobridge.admin"); // 设置权限
     }
 
     private void msg(CommandSender sender, String message) {
         sender.sendMessage(mm.deserialize(message));
     }
 
+    // [修改] 方法签名变更为 execute
     @Override
-    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command,
-                             @NotNull String label, @NotNull String[] args) {
-        if (!sender.hasPermission("ecobridge.admin")) {
+    public boolean execute(@NotNull CommandSender sender, @NotNull String commandLabel, @NotNull String[] args) {
+        if (!testPermission(sender)) {
             msg(sender, "<red>❌ 你没有权限执行此操作。");
             return true;
         }
@@ -53,6 +55,22 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
         return true;
     }
 
+    // [修改] 方法签名变更为 tabComplete
+    @Override
+    public @NotNull List<String> tabComplete(@NotNull CommandSender sender, @NotNull String alias, @NotNull String[] args) {
+        if (args.length == 1) {
+            return filter(args[0], Arrays.asList("reload", "check", "inspect", "save", "perf", "simd", "health", "benchmark", "help"));
+        }
+        if (args.length == 2) {
+            if (args[0].equalsIgnoreCase("check")) return Collections.emptyList();
+            if (args[0].equalsIgnoreCase("inspect")) return filter(args[1], plugin.getIntegrationManager().getMonitoredItems());
+        }
+        return Collections.emptyList();
+    }
+
+    // ... 以下所有 handleXxx 方法和 sendHelp 方法的内容保持不变 ...
+    // ... 直接复制之前的 handleReload, handleCheck, sendHelp 等私有方法 ...
+    
     private void sendHelp(CommandSender sender) {
         msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         msg(sender, "<gradient:gold:yellow><bold>EcoBridge</gradient> <dark_gray>» <gray>v" +
@@ -75,32 +93,21 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
     private void handleReload(CommandSender sender) {
         msg(sender, "<yellow>⟳ 正在执行热重载...");
         long start = System.currentTimeMillis();
-
-        // 1. [Sync] 必须在主线程执行的操作 (Config, Arrays)
-        // 这一步非常快，不会卡顿服务器
         try {
-            plugin.reloadConfig(); // Bukkit Config API 必须主线程
-            plugin.getPidController().reloadConfig(); 
-            
-            // 关键修复：syncShops 修改数组引用，必须与 captureDataSnapshot 互斥 (同在主线程)
+            plugin.reloadConfig();
+            plugin.getPidController().reloadConfig();
             plugin.getIntegrationManager().syncShops(); 
-            
         } catch (Exception e) {
             msg(sender, "<red>✗ 配置/内存重载失败: " + e.getMessage());
             e.printStackTrace();
             return;
         }
 
-        // 2. [Async] 可以/应该异步执行的操作 (I/O, Network)
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             try {
-                // 刷新网络缓存
                 plugin.getMarketManager().updateHolidayCache();
-                // 重新计算经济指标
                 plugin.getMarketManager().updateEconomyMetrics();
                 plugin.getMarketManager().updateMarketFlux();
-
-                // 回调主线程发送完成消息
                 Bukkit.getScheduler().runTask(plugin, () -> 
                     msg(sender, "<green>✓ 重载成功! 耗时: <white>" + (System.currentTimeMillis() - start) + "ms")
                 );
@@ -223,7 +230,6 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
                 int[] handles = new int[batchSize];
                 double[] volumes = new double[batchSize];
 
-                // 填充随机有效 handle（使用缓存中的物品）
                 List<String> monitored = plugin.getIntegrationManager().getMonitoredItems();
                 if (monitored.isEmpty()) {
                     msg(sender, "<red>✗ 没有可用于基准测试的物品数据。");
@@ -233,7 +239,7 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
                 for (int i = 0; i < batchSize; i++) {
                     String id = monitored.get(i % monitored.size());
                     handles[i] = pid.getHandle(id);
-                    volumes[i] = 800 + rand.nextDouble() * 400; // 模拟交易量波动
+                    volumes[i] = 800 + rand.nextDouble() * 400;
                 }
 
                 int batches = totalIterations / batchSize;
@@ -267,20 +273,8 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
             return;
         }
         msg(sender, "<yellow>正在手动刷写 " + dirty + " 条数据...");
-        plugin.getPidController().flushBuffer(true); // 同步刷写
+        plugin.getPidController().flushBuffer(true);
         msg(sender, "<green>数据已安全持久化至数据库。");
-    }
-
-    @Override
-    public @Nullable List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String[] args) {
-        if (args.length == 1) {
-            return filter(args[0], Arrays.asList("reload", "check", "inspect", "save", "perf", "simd", "health", "benchmark", "help"));
-        }
-        if (args.length == 2) {
-            if (args[0].equalsIgnoreCase("check")) return null;
-            if (args[0].equalsIgnoreCase("inspect")) return filter(args[1], plugin.getIntegrationManager().getMonitoredItems());
-        }
-        return Collections.emptyList();
     }
 
     private List<String> filter(String input, List<String> list) {
