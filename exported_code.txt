@@ -35,6 +35,7 @@ compileOnly("me.clip:placeholderapi:2.11.6")
 compileOnly("su.nightexpress.coinsengine:CoinsEngine:2.6.0")
 compileOnly("su.nightexpress.nightcore:main:2.13.0")
 compileOnly("cn.superiormc.ultimateshop:plugin:4.2.3")
+compileOnly("com.github.luben:zstd-jni:1.5.6-2")
 // 本地 libs
 compileOnly(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
 // 3. 知识提取/数据处理库
@@ -56,6 +57,13 @@ options.compilerArgs.addAll(listOf(
 "--enable-preview",
 "--add-modules=jdk.incubator.vector"
 ))
+}
+// [新增] 配置测试任务以支持预览特性
+test {
+jvmArgs(
+"--enable-preview",
+"--add-modules=jdk.incubator.vector"
+)
 }
 processResources {
 val props = mapOf("version" to version)
@@ -84,6 +92,13 @@ exclude(dependency("com.zaxxer:HikariCP:.*"))
 build {
 dependsOn("shadowJar")
 }
+// [新增] 配置 runServer 任务以支持预览特性
+named<xyz.jpenilla.runtask.task.AbstractRun>("runServer") {
+jvmArgs(
+"--enable-preview",
+"--add-modules=jdk.incubator.vector"
+)
+}
 }
 
 ==================================================
@@ -100,235 +115,6 @@ maven("https://repo.papermc.io/repository/maven-public/")
 rootProject.name = "EcoBridge"
 
 ==================================================
-FILE: EcoBridge_Project\src\main\java\top\ellan\ecobridge\DatabaseManager.java
-==================================================
-
-package top.ellan.ecobridge;
-import com.zaxxer.hikari.HikariConfig;
-import com.zaxxer.hikari.HikariDataSource;
-import java.sql.*;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.logging.Level;
-public class DatabaseManager {
-public record PidDbSnapshot(String itemId, double integral, double lastError,
-double lastLambda, long updateTime) {}
-private final EcoBridge plugin;
-private HikariDataSource dataSource;
-private final BlockingQueue<PidDbSnapshot> pendingWrites = new LinkedBlockingQueue<>(10000);
-private final ScheduledExecutorService batchScheduler = Executors.newSingleThreadScheduledExecutor(
-Thread.ofVirtual().factory()
-);
-private final AtomicInteger optimalBatchSize = new AtomicInteger(500);
-private volatile boolean initialized = false;
-public DatabaseManager(EcoBridge plugin) {
-this.plugin = plugin;
-}
-public void initPool() {
-Thread.ofVirtual().start(() -> {
-try {
-HikariConfig config = buildConfig();
-this.dataSource = new HikariDataSource(config);
-warmupPool();
-createTable();
-startBatchWriter();
-initialized = true;
-plugin.getLogger().info("[DB] HikariCP initialized: " +
-config.getMaximumPoolSize() + " connections, VirtualThread enabled");
-plugin.getPidController().loadAllStates();
-} catch (Exception e) {
-plugin.getLogger().severe("[DB] Init failed: " + e.getMessage());
-e.printStackTrace();
-}
-});
-}
-private HikariConfig buildConfig() {
-HikariConfig config = new HikariConfig();
-String url = plugin.getConfig().getString("database.url",
-"jdbc:mariadb:
-String user = plugin.getConfig().getString("database.user", "root");
-String pass = plugin.getConfig().getString("database.password", "password");
-config.setJdbcUrl(url);
-config.setUsername(user);
-config.setPassword(pass);
-config.addDataSourceProperty("cachePrepStmts", "true");
-config.addDataSourceProperty("prepStmtCacheSize", "500");
-config.addDataSourceProperty("prepStmtCacheSqlLimit", "4096");
-config.addDataSourceProperty("useServerPrepStmts", "true");
-config.addDataSourceProperty("useLocalSessionState", "true");
-config.addDataSourceProperty("rewriteBatchedStatements", "true");
-config.addDataSourceProperty("cacheResultSetMetadata", "true");
-config.addDataSourceProperty("cacheServerConfiguration", "true");
-config.addDataSourceProperty("elideSetAutoCommits", "true");
-config.addDataSourceProperty("maintainTimeStats", "false");
-config.addDataSourceProperty("useUnbufferedInput", "false");
-config.setMaximumPoolSize(16);
-config.setMinimumIdle(4);
-config.setIdleTimeout(300000);
-config.setConnectionTimeout(10000);
-config.setMaxLifetime(1800000);
-config.setKeepaliveTime(60000);
-config.setLeakDetectionThreshold(30000);
-config.setPoolName("EcoBridge-Hikari");
-config.setThreadFactory(Thread.ofVirtual().factory());
-return config;
-}
-private void warmupPool() {
-try (Connection conn = dataSource.getConnection()) {
-try (Statement stmt = conn.createStatement()) {
-stmt.execute("SELECT 1");
-}
-plugin.getLogger().info("[DB] Connection pool warmed up");
-} catch (SQLException e) {
-plugin.getLogger().warning("[DB] Warmup failed: " + e.getMessage());
-}
-}
-private void createTable() throws SQLException {
-try (Connection conn = dataSource.getConnection();
-Statement stmt = conn.createStatement()) {
-stmt.execute("""
-CREATE TABLE IF NOT EXISTS eb_pid_states (
-item_id VARCHAR(64) PRIMARY KEY,
-integral DOUBLE NOT NULL DEFAULT 0,
-last_error DOUBLE NOT NULL DEFAULT 0,
-last_lambda DOUBLE NOT NULL DEFAULT 0.002,
-update_time BIGINT NOT NULL DEFAULT 0,
-INDEX idx_update_time (update_time)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-ROW_FORMAT=DYNAMIC
-""");
-plugin.getLogger().info("[DB] Table 'eb_pid_states' ready");
-}
-}
-private void startBatchWriter() {
-batchScheduler.scheduleAtFixedRate(() -> {
-try {
-flushPendingWrites();
-} catch (Exception e) {
-plugin.getLogger().log(Level.WARNING, "[DB] Batch write error", e);
-}
-}, 500, 500, TimeUnit.MILLISECONDS);
-}
-public void saveBatch(List<PidDbSnapshot> snapshots) {
-if (!initialized || snapshots.isEmpty()) return;
-if (snapshots.size() <= 100) {
-pendingWrites.addAll(snapshots);
-return;
-}
-Thread.ofVirtual().start(() -> executeBatchWrite(snapshots));
-}
-private void flushPendingWrites() {
-if (pendingWrites.isEmpty()) return;
-List<PidDbSnapshot> batch = new ArrayList<>(optimalBatchSize.get());
-pendingWrites.drainTo(batch, optimalBatchSize.get());
-if (!batch.isEmpty()) {
-executeBatchWrite(batch);
-}
-}
-private void executeBatchWrite(List<PidDbSnapshot> snapshots) {
-if (dataSource == null || dataSource.isClosed()) return;
-String sql = """
-INSERT INTO eb_pid_states (item_id, integral, last_error, last_lambda, update_time)
-VALUES (?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE
-integral = VALUES(integral),
-last_error = VALUES(last_error),
-last_lambda = VALUES(last_lambda),
-update_time = VALUES(update_time)
-""";
-long startNs = System.nanoTime();
-try (Connection conn = dataSource.getConnection()) {
-boolean originalAutoCommit = conn.getAutoCommit();
-conn.setAutoCommit(false);
-try (PreparedStatement ps = conn.prepareStatement(sql)) {
-for (PidDbSnapshot record : snapshots) {
-ps.setString(1, record.itemId());
-ps.setDouble(2, record.integral());
-ps.setDouble(3, record.lastError());
-ps.setDouble(4, record.lastLambda());
-ps.setLong(5, record.updateTime());
-ps.addBatch();
-}
-ps.executeBatch();
-conn.commit();
-long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
-adjustBatchSize(snapshots.size(), elapsedMs);
-if (plugin.getConfig().getBoolean("debug-db", false)) {
-plugin.getLogger().info(String.format(
-"[DB] Saved %d items in %dms (%.1f items/ms)",
-snapshots.size(), elapsedMs, snapshots.size() / (double) Math.max(1, elapsedMs)
-));
-}
-} catch (SQLException e) {
-conn.rollback();
-throw e;
-} finally {
-conn.setAutoCommit(originalAutoCommit);
-}
-} catch (SQLException e) {
-plugin.getLogger().log(Level.WARNING,
-"[DB] Batch save failed for " + snapshots.size() + " items", e);
-}
-}
-private void adjustBatchSize(int currentSize, long elapsedMs) {
-if (elapsedMs < 50) {
-optimalBatchSize.updateAndGet(old -> Math.min(2000, (int) (old * 1.2)));
-} else if (elapsedMs > 150) {
-optimalBatchSize.updateAndGet(old -> Math.max(100, (int) (old * 0.8)));
-}
-}
-public void loadStates(java.util.function.Consumer<PidDbSnapshot> consumer) {
-if (dataSource == null || dataSource.isClosed()) return;
-Thread.ofVirtual().start(() -> {
-try (Connection conn = dataSource.getConnection();
-Statement stmt = conn.createStatement()) {
-stmt.setFetchSize(1000);
-try (ResultSet rs = stmt.executeQuery("SELECT * FROM eb_pid_states")) {
-int count = 0;
-while (rs.next()) {
-consumer.accept(new PidDbSnapshot(
-rs.getString("item_id"),
-rs.getDouble("integral"),
-rs.getDouble("last_error"),
-rs.getDouble("last_lambda"),
-rs.getLong("update_time")
-));
-count++;
-}
-plugin.getLogger().info("[DB] Loaded " + count + " PID states from database");
-}
-} catch (SQLException e) {
-plugin.getLogger().severe("[DB] Failed to load states: " + e.getMessage());
-e.printStackTrace();
-}
-});
-}
-public void closePool() {
-flushPendingWrites();
-batchScheduler.shutdown();
-try {
-if (!batchScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-batchScheduler.shutdownNow();
-}
-} catch (InterruptedException e) {
-batchScheduler.shutdownNow();
-}
-if (dataSource != null && !dataSource.isClosed()) {
-dataSource.close();
-plugin.getLogger().info("[DB] Connection pool closed");
-}
-}
-public HikariDataSource getDataSource() {
-return dataSource;
-}
-public boolean isInitialized() {
-return initialized;
-}
-}
-
-==================================================
 FILE: EcoBridge_Project\src\main\java\top\ellan\ecobridge\EcoBridge.java
 ==================================================
 
@@ -342,6 +128,7 @@ private DatabaseManager databaseManager;
 private PidController pidController;
 private MarketManager marketManager;
 private IntegrationManager integrationManager;
+private WebManager webManager;
 private PerformanceMonitor performanceMonitor;
 private volatile boolean fullyInitialized = false;
 @Override
@@ -355,12 +142,13 @@ getLogger().info("════════════════════�
 try {
 saveDefaultConfig();
 initializeComponents();
+pidController.reloadConfig();
 databaseManager.initPool();
 registerPlaceholderAPI();
 registerCommands();
 startSchedulers();
 if (getConfig().getBoolean("monitoring.enabled", true)) {
-performanceMonitor = new PerformanceMonitor(this);
+performanceMonitor = new PerformanceMonitor(this, pidController);
 getLogger().info("Performance monitoring enabled");
 }
 warmupCriticalPaths();
@@ -386,32 +174,37 @@ getLogger().info("════════════════════�
 fullyInitialized = false;
 try {
 if (performanceMonitor != null) {
-getLogger().info("[1/6] Stopping performance monitor...");
+getLogger().info("[1/7] Stopping performance monitor...");
 performanceMonitor.shutdown();
 }
 if (pidController != null) {
-getLogger().info("[2/6] Flushing PID buffer...");
-int pendingWrites = pidController.getDirtyQueueSize();
-if (pendingWrites > 0) {
-getLogger().info("  → " + pendingWrites + " pending writes");
+getLogger().info("[2/7] 将 PID 内存数据推送至数据库队列...");
+int dirty = pidController.getDirtyQueueSize();
+if (dirty > 0) {
+getLogger().info("  → " + dirty + " 条脏数据进入队列");
 }
 pidController.flushBuffer(true);
-waitForDatabaseFlush(5000);
-getLogger().info("  → Closing FFM Arena...");
-pidController.close();
-}
-if (marketManager != null) {
-getLogger().info("[3/6] Shutting down market manager...");
-marketManager.shutdown();
-}
-if (integrationManager != null) {
-getLogger().info("[4/6] Closing integration manager...");
 }
 if (databaseManager != null) {
-getLogger().info("[5/6] Closing database pool...");
+getLogger().info("[3/7] 等待数据库异步写入完成...");
+waitForDatabaseManager(8000);
+}
+if (databaseManager != null) {
+getLogger().info("[4/7] 关闭数据库连接池...");
 databaseManager.closePool();
 }
-getLogger().info("[6/6] Cleaning up references...");
+if (pidController != null) {
+getLogger().info("[5/7] 释放堆外内存 Arena...");
+pidController.close();
+}
+if (webManager != null) {
+getLogger().info("[6/7] Shutting down WebManager...");
+webManager.shutdown();
+}
+if (marketManager != null) {
+getLogger().info("[7/7] Shutting down market manager...");
+marketManager.shutdown();
+}
 instance = null;
 getLogger().info("═══════════════════════════════════════════════");
 getLogger().info("  ✓ EcoBridge shutdown complete");
@@ -426,11 +219,13 @@ getLogger().info("Initializing core components...");
 this.databaseManager = new DatabaseManager(this);
 getLogger().info("  ✓ DatabaseManager");
 this.pidController = new PidController(this);
-getLogger().info("  ✓ PidController (SoA + SIMD)");
+getLogger().info("  ✓ PidController");
 this.marketManager = new MarketManager(this);
-getLogger().info("  ✓ MarketManager (VirtualThreads)");
+getLogger().info("  ✓ MarketManager");
 this.integrationManager = new IntegrationManager(this);
 getLogger().info("  ✓ IntegrationManager");
+this.webManager = new WebManager(this);
+getLogger().info("  ✓ WebManager");
 }
 private void registerPlaceholderAPI() {
 if (Bukkit.getPluginManager().getPlugin("PlaceholderAPI") != null) {
@@ -497,6 +292,20 @@ getLogger().warning("[Scheduler] Market flux error: " + e.getMessage());
 }
 }.runTaskTimerAsynchronously(this, marketDelay, marketInterval);
 getLogger().info("  ✓ Market flux: every " + (marketInterval / 20 / 60) + "min");
+long reportInterval = 1200L;
+long reportDelay = 1200L;
+new BukkitRunnable() {
+@Override
+public void run() {
+if (!fullyInitialized) return;
+try {
+webManager.pushMetrics(marketManager.getInflation(), performanceMonitor.getCurrentStats());
+} catch (Exception e) {
+getLogger().warning("[Scheduler] Report push error: " + e.getMessage());
+}
+}
+}.runTaskTimerAsynchronously(this, reportDelay, reportInterval);
+getLogger().info("  ✓ Report sampling: every " + (reportInterval / 20) + "s");
 }
 private void warmupCriticalPaths() {
 if (!getConfig().getBoolean("performance.memory-warmup", true)) return;
@@ -510,9 +319,11 @@ Thread.sleep(100);
 if (databaseManager.isInitialized()) {
 integrationManager.syncShops();
 getLogger().info("  ✓ Shop data synced");
+pidController.loadAllStates();
 marketManager.updateMarketFlux();
 marketManager.updateHolidayCache();
 getLogger().info("  ✓ Market data initialized");
+pidController.reloadConfig();
 getLogger().info("  ✓ Warmup complete");
 } else {
 getLogger().warning("  ⚠ Database not ready, skipping warmup");
@@ -522,21 +333,22 @@ getLogger().warning("Warmup error: " + e.getMessage());
 }
 });
 }
-private void waitForDatabaseFlush(long timeoutMs) {
+private void waitForDatabaseManager(long timeoutMs) {
 long startTime = System.currentTimeMillis();
 while (System.currentTimeMillis() - startTime < timeoutMs) {
-int pending = pidController.getDirtyQueueSize();
+int pending = databaseManager.getPendingWritesCount();
 if (pending == 0) {
-getLogger().info("  ✓ All data flushed to database");
+getLogger().info("  ✓ 数据库队列已排空，所有数据已落盘");
 return;
 }
+getLogger().info("  → 数据库队列剩余: " + pending + " 条");
 try {
-Thread.sleep(100);
+Thread.sleep(150);
 } catch (InterruptedException e) {
 break;
 }
 }
-getLogger().warning("  ⚠ Database flush timeout, some data may be lost");
+getLogger().warning("  ⚠ 数据库刷写超时（" + timeoutMs + "ms），可能丢失部分数据");
 }
 private void emergencyShutdown() {
 try {
@@ -544,7 +356,8 @@ if (pidController != null) pidController.close();
 if (marketManager != null) marketManager.shutdown();
 if (databaseManager != null) databaseManager.closePool();
 if (performanceMonitor != null) performanceMonitor.shutdown();
-} catch (Exception e) {
+if (webManager != null) webManager.shutdown();
+} catch (Exception ignored) {
 }
 }
 public static EcoBridge getInstance() {
@@ -564,6 +377,9 @@ return integrationManager;
 }
 public PerformanceMonitor getPerformanceMonitor() {
 return performanceMonitor;
+}
+public WebManager getWebManager() {
+return webManager;
 }
 public boolean isFullyInitialized() {
 return fullyInitialized;
@@ -587,6 +403,7 @@ import org.jetbrains.annotations.Nullable;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Random;
 import java.util.stream.Collectors;
 public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
 private final EcoBridge plugin;
@@ -628,7 +445,7 @@ msg(sender, "<gradient:gold:yellow><bold>EcoBridge</gradient> <dark_gray>» <gra
 plugin.getPluginMeta().getVersion());
 msg(sender, "");
 msg(sender, " <yellow>基础维护:");
-msg(sender, "  <gold>/eb reload <dark_gray>• <gray>热重载配置、商店与市场缓存 ");
+msg(sender, "  <gold>/eb reload <dark_gray>• <gray>热重载配置、商店、市场、PID 参数 ");
 msg(sender, "  <gold>/eb check [玩家] <dark_gray>• <gray>分析指定玩家的经济因子");
 msg(sender, "  <gold>/eb inspect <ID> <dark_gray>• <gray>实时审查物品 PID 运行数据");
 msg(sender, "  <gold>/eb save <dark_gray>• <gray>强制刷写脏数据至数据库");
@@ -637,15 +454,16 @@ msg(sender, " <yellow>高级诊断:");
 msg(sender, "  <gold>/eb perf <dark_gray>• <gray>查看内存、TPS 及缓存统计");
 msg(sender, "  <gold>/eb simd <dark_gray>• <gray>CPU 向量化指令集兼容性诊断");
 msg(sender, "  <gold>/eb health <dark_gray>• <gray>系统模块健康度自动化检查");
-msg(sender, "  <gold>/eb benchmark <dark_gray>• <gray>执行非线性压力基准测试");
+msg(sender, "  <gold>/eb benchmark confirm <dark_gray>• <gray>执行 5M 次 PID 压力基准测试");
 msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
 private void handleReload(CommandSender sender) {
-msg(sender, "<yellow>⟳ 正在异步重载全系统模块...");
+msg(sender, "<yellow>⟳ 正在异步重载全系统模块（含 PID 参数）...");
 Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
 long start = System.currentTimeMillis();
 try {
 plugin.reloadConfig();
+plugin.getPidController().reloadConfig();
 plugin.getIntegrationManager().syncShops();
 plugin.getMarketManager().updateHolidayCache();
 plugin.getMarketManager().updateEconomyMetrics();
@@ -653,6 +471,7 @@ plugin.getMarketManager().updateMarketFlux();
 msg(sender, "<green>✓ 重载成功! 耗时: <white>" + (System.currentTimeMillis() - start) + "ms");
 } catch (Exception e) {
 msg(sender, "<red>✗ 重载失败: " + e.getMessage());
+e.printStackTrace();
 }
 });
 }
@@ -686,7 +505,8 @@ msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━�
 private void handleHealth(CommandSender sender) {
 msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 msg(sender, "<gradient:green:lime>系统健康普查</gradient>");
-boolean db = plugin.getDatabaseManager().getDataSource() != null && !plugin.getDatabaseManager().getDataSource().isClosed();
+boolean db = plugin.getDatabaseManager().getDataSource() != null &&
+!plugin.getDatabaseManager().getDataSource().isClosed();
 msg(sender, " <gray>数据库连接: " + (db ? "<green>健康" : "<red>离线"));
 int shops = plugin.getIntegrationManager().getMonitoredItems().size();
 msg(sender, " <gray>商店映射: <white>" + (shops > 0 ? "<green>已挂载 (" + shops + ")" : "<red>无数据"));
@@ -739,7 +559,45 @@ if (args.length < 2 || !args[1].equalsIgnoreCase("confirm")) {
 msg(sender, "<yellow>⚠ 该操作将瞬时产生高负载。请输入 <gold>/eb benchmark confirm <yellow>确认。");
 return;
 }
-msg(sender, "<aqua>正在启动 5,000,000 次 PID 模拟迭代测试...");
+msg(sender, "<aqua>正在启动 5,000,000 次 PID 模拟迭代压力测试...（异步执行）");
+Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+try {
+PidController pid = plugin.getPidController();
+Random rand = new Random();
+int totalIterations = 5_000_000;
+int batchSize = 4096;
+long startNs = System.nanoTime();
+int[] handles = new int[batchSize];
+double[] volumes = new double[batchSize];
+List<String> monitored = plugin.getIntegrationManager().getMonitoredItems();
+if (monitored.isEmpty()) {
+msg(sender, "<red>✗ 没有可用于基准测试的物品数据。");
+return;
+}
+for (int i = 0; i < batchSize; i++) {
+String id = monitored.get(i % monitored.size());
+handles[i] = pid.getHandle(id);
+volumes[i] = 800 + rand.nextDouble() * 400;
+}
+int batches = totalIterations / batchSize;
+for (int b = 0; b < batches; b++) {
+pid.calculateBatch(handles, volumes, batchSize);
+}
+long elapsedNs = System.nanoTime() - startNs;
+double elapsedMs = elapsedNs / 1_000_000.0;
+double opsPerSec = totalIterations / (elapsedNs / 1_000_000_000.0);
+msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+msg(sender, "<gradient:aqua:blue>Benchmark 结果</gradient>");
+msg(sender, " <gray>总迭代次数: <white>" + totalIterations);
+msg(sender, String.format(" <gray>耗时: <white>%.2f ms", elapsedMs));
+msg(sender, String.format(" <gray>吞吐量: <gold>%.0f ops/s", opsPerSec));
+msg(sender, " <gray>平均每批: <white>" + String.format("%.2f ms", elapsedMs / batches));
+msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+} catch (Exception e) {
+msg(sender, "<red>✗ Benchmark 执行失败: " + e.getMessage());
+e.printStackTrace();
+}
+});
 }
 private void handleSave(CommandSender sender) {
 int dirty = plugin.getPidController().getDirtyQueueSize();
@@ -934,6 +792,268 @@ return String.format("%.1f%%", ratio * 100);
 }
 
 ==================================================
+FILE: EcoBridge_Project\src\main\java\top\ellan\ecobridge\FastSnapshotManager.java
+==================================================
+
+package top.ellan.ecobridge;
+import com.github.luben.zstd.Zstd;
+import org.bukkit.Bukkit;
+import java.io.*;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
+import java.util.zip.CRC32;
+public class FastSnapshotManager {
+private final EcoBridge plugin;
+private final Path dataDir;
+private final BlockingQueue<DatabaseManager.PidDbSnapshot> writeQueue = new LinkedBlockingQueue<>(100000);
+private final int flushThresholdItems;
+private final int flushIntervalMs;
+private final int compressionLevel;
+private final AtomicBoolean running = new AtomicBoolean(true);
+private Thread writerThread;
+private static final String SNAPSHOT_EXT = ".zst";
+private static final String INDEX_FILE = "latest_snapshot.id";
+public FastSnapshotManager(EcoBridge plugin) {
+this.plugin = plugin;
+this.dataDir = Paths.get(plugin.getDataFolder().getAbsolutePath(), "snapshots");
+try {
+if (!Files.exists(dataDir)) Files.createDirectories(dataDir);
+} catch (IOException e) {
+throw new RuntimeException("Failed to create snapshot directory", e);
+}
+this.flushThresholdItems = plugin.getConfig().getInt("persistence.flush-items", 5000);
+this.flushIntervalMs = plugin.getConfig().getInt("persistence.flush-interval-ms", 5000);
+this.compressionLevel = plugin.getConfig().getInt("persistence.compression-level", 3);
+startWriter();
+}
+private void startWriter() {
+this.writerThread = Thread.ofVirtual()
+.name("EcoBridge-SnapshotWriter")
+.start(this::writerLoop);
+}
+private void writerLoop() {
+ArrayList<DatabaseManager.PidDbSnapshot> buffer = new ArrayList<>(flushThresholdItems);
+long lastFlushTime = System.currentTimeMillis();
+while (running.get()) {
+try {
+DatabaseManager.PidDbSnapshot item = writeQueue.poll();
+if (item != null) {
+buffer.add(item);
+while (buffer.size() < flushThresholdItems && (item = writeQueue.poll()) != null) {
+buffer.add(item);
+}
+}
+long now = System.currentTimeMillis();
+boolean shouldFlush = !buffer.isEmpty() && (buffer.size() >= flushThresholdItems || (now - lastFlushTime > flushIntervalMs));
+if (shouldFlush) {
+flushToDisk(buffer);
+buffer.clear();
+lastFlushTime = now;
+} else {
+LockSupport.parkNanos(100_000_000);
+}
+} catch (Exception e) {
+plugin.getLogger().severe("[Snapshot] Writer error: " + e.getMessage());
+e.printStackTrace();
+LockSupport.parkNanos(1_000_000_000);
+}
+}
+if (!buffer.isEmpty()) {
+flushToDisk(buffer);
+}
+}
+private void flushToDisk(List<DatabaseManager.PidDbSnapshot> data) {
+if (data.isEmpty()) return;
+long startNs = System.nanoTime();
+String filename = "pid_snapshot_" + System.currentTimeMillis() + SNAPSHOT_EXT;
+Path targetFile = dataDir.resolve(filename);
+try {
+StringBuilder jsonBuilder = new StringBuilder(data.size() * 150);
+jsonBuilder.append("[");
+for (int i = 0; i < data.size(); i++) {
+DatabaseManager.PidDbSnapshot s = data.get(i);
+jsonBuilder.append("{\"i\":\"").append(escapeJson(s.itemId()))
+.append("\",\"in\":").append(s.integral())
+.append(",\"le\":").append(s.lastError())
+.append(",\"ll\":").append(s.lastLambda())
+.append(",\"ut\":").append(s.updateTime())
+.append("}");
+if (i < data.size() - 1) jsonBuilder.append(",");
+}
+jsonBuilder.append("]");
+byte[] jsonBytes = jsonBuilder.toString().getBytes(StandardCharsets.UTF_8);
+ByteBuffer srcBuf = ByteBuffer.allocateDirect(jsonBytes.length);
+srcBuf.put(jsonBytes);
+srcBuf.flip();
+int maxCompressedSize = (int) Zstd.compressBound(jsonBytes.length);
+ByteBuffer destBuf = ByteBuffer.allocateDirect(maxCompressedSize);
+long compressedSize = Zstd.compressDirectByteBuffer(
+destBuf, 0, maxCompressedSize,
+srcBuf, 0, jsonBytes.length,
+compressionLevel
+);
+try (FileChannel channel = FileChannel.open(targetFile,
+StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW)) {
+ByteBuffer header = ByteBuffer.allocate(12);
+header.putInt(0x4E505344);
+header.putInt(0x56313030);
+header.putInt(jsonBytes.length);
+header.flip();
+channel.write(header);
+destBuf.limit((int) compressedSize);
+channel.write(destBuf);
+}
+updateLatestIndex(filename);
+long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
+plugin.getLogger().info(String.format(
+"[Snapshot] Saved %d items (%.2f KB -> %.2f KB) in %dms (Ratio: %.2f%%)",
+data.size(),
+jsonBytes.length / 1024.0,
+compressedSize / 1024.0,
+elapsedMs,
+(compressedSize * 100.0 / jsonBytes.length)
+));
+} catch (Exception e) {
+plugin.getLogger().severe("[Snapshot] Flush failed: " + e.getMessage());
+e.printStackTrace();
+}
+}
+public void loadStates(Consumer<DatabaseManager.PidDbSnapshot> consumer) {
+String latestFilename = readLatestIndex();
+if (latestFilename == null) {
+plugin.getLogger().info("[Snapshot] No previous snapshot found. Starting fresh.");
+return;
+}
+Path snapshotFile = dataDir.resolve(latestFilename);
+if (!Files.exists(snapshotFile)) {
+plugin.getLogger().warning("[Snapshot] Index points to missing file: " + latestFilename);
+return;
+}
+plugin.getLogger().info("[Snapshot] Loading from: " + latestFilename);
+long startNs = System.nanoTime();
+try (FileChannel channel = FileChannel.open(snapshotFile, StandardOpenOption.READ)) {
+long fileSize = channel.size();
+if (fileSize < 12) throw new IOException("File too small (corrupted header)");
+MappedByteBuffer headerBuffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, 12);
+int magic = headerBuffer.getInt();
+int version = headerBuffer.getInt();
+int uncompressedSize = headerBuffer.getInt();
+if (magic != 0x4E505344) throw new IOException("Invalid magic number");
+if (version != 0x56313030) throw new IOException("Unsupported version");
+long compressedSize = fileSize - 12;
+MappedByteBuffer compressedBuffer = channel.map(FileChannel.MapMode.READ_ONLY, 12, compressedSize);
+ByteBuffer destBuffer = ByteBuffer.allocateDirect(uncompressedSize);
+long size = Zstd.decompressDirectByteBuffer(
+destBuffer, 0, uncompressedSize,
+compressedBuffer, 0, compressedSize
+);
+if (size != uncompressedSize) throw new IOException("Decompression size mismatch");
+destBuffer.flip();
+byte[] jsonBytes = new byte[uncompressedSize];
+destBuffer.get(jsonBytes);
+String jsonStr = new String(jsonBytes, StandardCharsets.UTF_8);
+int count = parseAndConsume(jsonStr, consumer);
+long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
+plugin.getLogger().info(String.format(
+"[Snapshot] Loaded %d items in %dms (%.1f items/sec)",
+count, elapsedMs, count * 1000.0 / Math.max(1, elapsedMs)
+));
+} catch (Exception e) {
+plugin.getLogger().severe("[Snapshot] Failed to load snapshot: " + e.getMessage());
+e.printStackTrace();
+}
+}
+private int parseAndConsume(String json, Consumer<DatabaseManager.PidDbSnapshot> consumer) {
+int count = 0;
+int len = json.length();
+int i = 1;
+while (i < len) {
+if (json.charAt(i) == ']') break;
+if (json.charAt(i) == '{') {
+String id = null;
+double integral = 0, lastErr = 0, lastLam = 0;
+long updateTime = 0;
+int start = json.indexOf("\"i\":\"", i);
+int end = json.indexOf("\"", start + 5);
+if (start > 0 && end > 0) {
+id = json.substring(start + 5, end);
+}
+start = json.indexOf("\"in\":", end);
+end = json.indexOf(",", start);
+if (start > 0 && end > 0) integral = Double.parseDouble(json.substring(start + 5, end));
+start = json.indexOf("\"le\":", end);
+end = json.indexOf(",", start);
+if (start > 0 && end > 0) lastErr = Double.parseDouble(json.substring(start + 5, end));
+start = json.indexOf("\"ll\":", end);
+end = json.indexOf(",", start);
+if (start > 0 && end > 0) lastLam = Double.parseDouble(json.substring(start + 5, end));
+start = json.indexOf("\"ut\":", end);
+end = json.indexOf("}", start);
+if (start > 0 && end > 0) updateTime = Long.parseLong(json.substring(start + 5, end));
+if (id != null) {
+consumer.accept(new DatabaseManager.PidDbSnapshot(id, integral, lastErr, lastLam, updateTime));
+count++;
+}
+i = end + 1;
+} else {
+i++;
+}
+}
+return count;
+}
+public void saveSnapshot(DatabaseManager.PidDbSnapshot snapshot) {
+writeQueue.offer(snapshot);
+}
+public void saveBatch(List<DatabaseManager.PidDbSnapshot> snapshots) {
+writeQueue.addAll(snapshots);
+}
+private void updateLatestIndex(String filename) {
+try {
+Files.writeString(dataDir.resolve(INDEX_FILE), filename, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+} catch (IOException e) {
+plugin.getLogger().warning("[Snapshot] Failed to update index: " + e.getMessage());
+}
+}
+private String readLatestIndex() {
+try {
+if (Files.exists(dataDir.resolve(INDEX_FILE))) {
+return Files.readString(dataDir.resolve(INDEX_FILE));
+}
+} catch (IOException e) {
+}
+return null;
+}
+private String escapeJson(String s) {
+return s;
+}
+public void shutdown() {
+running.set(false);
+if (writerThread != null) {
+LockSupport.unpark(writerThread);
+try {
+writerThread.join(5000);
+} catch (InterruptedException e) {
+Thread.currentThread().interrupt();
+}
+}
+}
+}
+
+==================================================
 FILE: EcoBridge_Project\src\main\java\top\ellan\ecobridge\IntegrationManager.java
 ==================================================
 
@@ -943,13 +1063,21 @@ import cn.superiormc.ultimateshop.managers.ConfigManager;
 import cn.superiormc.ultimateshop.objects.ObjectShop;
 import cn.superiormc.ultimateshop.objects.buttons.ObjectItem;
 import cn.superiormc.ultimateshop.objects.caches.ObjectUseTimesCache;
+import cn.superiormc.ultimateshop.utils.ItemUtil;
 import org.bukkit.Bukkit;
+import org.bukkit.inventory.ItemStack;
 import java.util.*;
 public class IntegrationManager {
+public record TradeMetadata(
+String rawId,
+String displayName,
+String shopTitle
+) {}
 private record ItemEntry(
 String rawId,
 int pidHandle,
-ObjectItem item
+ObjectItem item,
+TradeMetadata metadata
 ) {}
 private final EcoBridge plugin;
 private volatile List<ItemEntry> activeEntries = Collections.emptyList();
@@ -957,6 +1085,14 @@ private volatile List<String> monitoredIdCache = Collections.emptyList();
 private final Map<Integer, Double> lastTotalVolumes = new HashMap<>(4096);
 public IntegrationManager(EcoBridge plugin) {
 this.plugin = plugin;
+}
+public List<TradeMetadata> getRecentTradesMetadata() {
+final List<ItemEntry> current = this.activeEntries;
+List<TradeMetadata> list = new ArrayList<>(current.size());
+for (ItemEntry entry : current) {
+list.add(entry.metadata());
+}
+return list;
 }
 public void collectDataAndCalculate() {
 final List<ItemEntry> currentItems = this.activeEntries;
@@ -1014,12 +1150,23 @@ ObjectShop shop = entry.getValue();
 if (shop == null) continue;
 List<ObjectItem> productList = shop.getProductList();
 if (productList == null) continue;
+String shopTitle = shopId;
 for (ObjectItem item : productList) {
 String productId = item.getProduct();
 if (productId == null || productId.isEmpty()) continue;
 String rawId = shopId + "_" + productId;
 int handle = pidCtrl.getHandle(rawId);
-newEntries.add(new ItemEntry(rawId, handle, item));
+String prettyName = item.getDisplayName(null);
+if (prettyName == null || prettyName.isEmpty()) {
+try {
+ItemStack displayItem = item.getDisplayItem(null);
+prettyName = ItemUtil.getItemName(displayItem);
+} catch (Exception e) {
+prettyName = rawId;
+}
+}
+TradeMetadata metadata = new TradeMetadata(rawId, prettyName, shopTitle);
+newEntries.add(new ItemEntry(rawId, handle, item, metadata));
 newIds.add(rawId);
 ObjectUseTimesCache cache = ShopHelper.getServerUseTimesCache(item);
 if (cache != null) {
@@ -1275,6 +1422,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 public class PerformanceMonitor {
 private final EcoBridge plugin;
+private final PidController pidController;
 private final ScheduledExecutorService scheduler;
 private BukkitTask syncCacheTask;
 private final LongAdder totalCalculations = new LongAdder();
@@ -1292,8 +1440,9 @@ private volatile int cachedPlayerCount = 0;
 private final int logInterval;
 private volatile long simdBandwidth = 0;
 private volatile int vectorLanes = 0;
-public PerformanceMonitor(EcoBridge plugin) {
+public PerformanceMonitor(EcoBridge plugin, PidController pidController) {
 this.plugin = plugin;
+this.pidController = pidController;
 this.logInterval = plugin.getConfig().getInt("monitoring.log-interval", 300);
 detectGCBeans();
 this.scheduler = Executors.newSingleThreadScheduledExecutor(
@@ -1381,6 +1530,9 @@ report.append(String.format(" §7GC(Old):   §f%d runs §7| §c%dms\n",
 oldGC.getCollectionCount(), oldGC.getCollectionTime()));
 }
 report.append(String.format(" §7TPS: §a%.1f §7| Players: §f%d\n", cachedTps[0], cachedPlayerCount));
+if (pidController != null) {
+report.append(String.format(" §7ContextPool: §f%d available\n", pidController.getContextPool().getAvailableCount()));
+}
 report.append(String.format(" §7DB IO: §fW:%,d R:%,d\n", dbWrites.sumThenReset(), dbReads.sumThenReset()));
 if (!counters.isEmpty()) {
 report.append(" §7Hotspots:\n");
@@ -1398,6 +1550,7 @@ scalarCalculations.reset();
 plugin.getLogger().warning("Error generating perf report: " + e.getMessage());
 }
 }
+public record MonitorStats(double tps, long memoryUsedMB, int threadCount) {}
 public static class PerformanceCounter {
 private final AtomicLong totalNs = new AtomicLong(0);
 private final AtomicLong count = new AtomicLong(0);
@@ -1424,6 +1577,14 @@ public void stopTimer(String name, long startNs) {
 PerformanceCounter c = counters.get(name);
 if (c != null) c.record(System.nanoTime() - startNs);
 }
+public MonitorStats getCurrentStats() {
+MemoryUsage heap = memoryBean.getHeapMemoryUsage();
+return new MonitorStats(
+cachedTps[0],
+heap.getUsed() / 1048576,
+threadBean.getThreadCount()
+);
+}
 public void shutdown() {
 if (syncCacheTask != null && !syncCacheTask.isCancelled()) {
 syncCacheTask.cancel();
@@ -1443,9 +1604,9 @@ package top.ellan.ecobridge;
 import jdk.incubator.vector.*;
 import java.lang.foreign.*;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.StampedLock;
+import java.util.concurrent.atomic.AtomicInteger;
 public class PidController implements AutoCloseable {
 private static final VectorSpecies<Double> SPECIES = DoubleVector.SPECIES_PREFERRED;
 private static final int V_LEN = SPECIES.length();
@@ -1456,81 +1617,136 @@ private static final int CAPACITY = 8192;
 private static final int SLOT_MASK = 0xFFFF;
 private static final ValueLayout.OfDouble D_LAYOUT = ValueLayout.JAVA_DOUBLE;
 private static final ValueLayout.OfLong L_LAYOUT = ValueLayout.JAVA_LONG;
-private static final ValueLayout.OfByte B_LAYOUT = ValueLayout.JAVA_BYTE;
 private static final long D_SIZE = 8L;
-private static final DoubleVector V_TARGET     = DoubleVector.broadcast(SPECIES, 1000.0);
-private static final DoubleVector V_DEADBAND   = DoubleVector.broadcast(SPECIES, 20.0);
-private static final DoubleVector V_NEG_TAU_INV = DoubleVector.broadcast(SPECIES, -0.00001929);
-private static final DoubleVector V_KP         = DoubleVector.broadcast(SPECIES, 0.00001);
-private static final DoubleVector V_KP_NEG     = DoubleVector.broadcast(SPECIES, 0.00001 * 0.6);
-private static final DoubleVector V_KI         = DoubleVector.broadcast(SPECIES, 0.000001);
-private static final DoubleVector V_KD         = DoubleVector.broadcast(SPECIES, 0.00005);
-private static final DoubleVector V_BASE       = DoubleVector.broadcast(SPECIES, 0.002);
-private static final DoubleVector V_ALPHA      = DoubleVector.broadcast(SPECIES, 0.05);
-private static final DoubleVector V_BETA       = DoubleVector.broadcast(SPECIES, 0.95);
-private static final DoubleVector V_ZERO       = DoubleVector.broadcast(SPECIES, 0.0);
-private static final DoubleVector V_ONE        = DoubleVector.broadcast(SPECIES, 1.0);
-private static final DoubleVector V_I_MAX      = DoubleVector.broadcast(SPECIES, 30000.0);
-private static final DoubleVector V_I_MIN      = DoubleVector.broadcast(SPECIES, -30000.0);
-private static final DoubleVector V_L_MAX      = DoubleVector.broadcast(SPECIES, 0.01);
-private static final DoubleVector V_L_MIN      = DoubleVector.broadcast(SPECIES, 0.0005);
-private static final DoubleVector V_DT_MAX     = DoubleVector.broadcast(SPECIES, 1.0);
-private static final DoubleVector V_DT_MIN     = DoubleVector.broadcast(SPECIES, 0.05);
+private double target;
+private double deadband;
+private double kp;
+private double kpNegativeMultiplier;
+private double ki;
+private double kd;
+private double base;
+private double alpha;
+private double beta;
+private double tau;
+private double integralMax;
+private double integralMin;
+private double lambdaMax;
+private double lambdaMin;
+private double dtMax;
+private double dtMin;
+private DoubleVector vTarget;
+private DoubleVector vDeadband;
+private DoubleVector vKp;
+private DoubleVector vKpNeg;
+private DoubleVector vKi;
+private DoubleVector vKd;
+private DoubleVector vBase;
+private DoubleVector vAlpha;
+private DoubleVector vBeta;
+private DoubleVector vZero;
+private DoubleVector vOne;
+private DoubleVector vIMax;
+private DoubleVector vIMin;
+private DoubleVector vLMax;
+private DoubleVector vLMin;
+private DoubleVector vDtMax;
+private DoubleVector vDtMin;
+private DoubleVector vNegTauInv;
 private final EcoBridge plugin;
 private final Arena arena;
 private final Segment[] segments;
 private final ConcurrentHashMap<String, Integer> registry = new ConcurrentHashMap<>(4096);
+private final ConcurrentHashMap<Integer, String> handleToId = new ConcurrentHashMap<>(4096);
 private final AtomicBoolean closed = new AtomicBoolean(false);
-private final ThreadLocal<CalcContext> tlContext = ThreadLocal.withInitial(CalcContext::new);
+private final DynamicCalcContextPool contextPool;
 public PidController(EcoBridge plugin) {
 this.plugin = plugin;
-this.arena = Arena.ofShared();
+this.arena = Arena.ofAuto();
 this.segments = new Segment[SEGMENT_COUNT];
 for (int i = 0; i < SEGMENT_COUNT; i++) {
 this.segments[i] = new Segment(arena);
 }
-plugin.getLogger().info("[PID] Ultimate Optimized Controller Initialized. Vector Lane: " + V_LEN);
+int cores = Runtime.getRuntime().availableProcessors();
+this.contextPool = new DynamicCalcContextPool(Math.max(4, cores), cores * 4);
+loadConfig();
+plugin.getLogger().info("[PID] Void-Object Controller Initialized. Zero-Boxing: Active | Padding: Active");
+}
+private void loadConfig() {
+var cfg = plugin.getConfig();
+this.target = cfg.getDouble("pid.target", 1000.0);
+this.deadband = cfg.getDouble("pid.deadband", 20.0);
+this.kp = cfg.getDouble("pid.kp", 0.00001);
+this.kpNegativeMultiplier = cfg.getDouble("pid.kp-negative-multiplier", 0.6);
+this.ki = cfg.getDouble("pid.ki", 0.000001);
+this.kd = cfg.getDouble("pid.kd", 0.00005);
+this.base = cfg.getDouble("pid.base", 0.002);
+this.alpha = cfg.getDouble("pid.alpha", 0.05);
+this.beta = cfg.getDouble("pid.beta", 0.95);
+this.tau = cfg.getDouble("pid.tau", 0.00001929);
+this.integralMax = cfg.getDouble("pid.integral-max", 30000.0);
+this.integralMin = cfg.getDouble("pid.integral-min", -30000.0);
+this.lambdaMax = cfg.getDouble("pid.lambda-max", 0.01);
+this.lambdaMin = cfg.getDouble("pid.lambda-min", 0.0005);
+this.dtMax = cfg.getDouble("pid.dt-max", 1.0);
+this.dtMin = cfg.getDouble("pid.dt-min", 0.05);
+initVectors();
+}
+private void initVectors() {
+this.vTarget = DoubleVector.broadcast(SPECIES, target);
+this.vDeadband = DoubleVector.broadcast(SPECIES, deadband);
+this.vKp = DoubleVector.broadcast(SPECIES, kp);
+this.vKpNeg = DoubleVector.broadcast(SPECIES, kp * kpNegativeMultiplier);
+this.vKi = DoubleVector.broadcast(SPECIES, ki);
+this.vKd = DoubleVector.broadcast(SPECIES, kd);
+this.vBase = DoubleVector.broadcast(SPECIES, base);
+this.vAlpha = DoubleVector.broadcast(SPECIES, alpha);
+this.vBeta = DoubleVector.broadcast(SPECIES, beta);
+this.vZero = DoubleVector.broadcast(SPECIES, 0.0);
+this.vOne = DoubleVector.broadcast(SPECIES, 1.0);
+this.vIMax = DoubleVector.broadcast(SPECIES, integralMax);
+this.vIMin = DoubleVector.broadcast(SPECIES, integralMin);
+this.vLMax = DoubleVector.broadcast(SPECIES, lambdaMax);
+this.vLMin = DoubleVector.broadcast(SPECIES, lambdaMin);
+this.vDtMax = DoubleVector.broadcast(SPECIES, dtMax);
+this.vDtMin = DoubleVector.broadcast(SPECIES, dtMin);
+this.vNegTauInv = DoubleVector.broadcast(SPECIES, -tau);
+}
+public void reloadConfig() {
+loadConfig();
+plugin.getLogger().info("[PID] Config reloaded.");
 }
 public int getHandle(String itemId) {
 return registry.computeIfAbsent(itemId, id -> {
 int hash = Math.abs(id.hashCode());
 int segId = hash & SEGMENT_MASK;
 Segment seg = segments[segId];
-long stamp = seg.lock.writeLock();
-try {
+synchronized (seg.lock) {
 int slot = seg.allocateSlot();
 if (slot < 0) {
 plugin.getLogger().warning("[PID] Segment " + segId + " overflow!");
 return -1;
 }
-return (segId << 16) | slot;
-} finally {
-seg.lock.unlockWrite(stamp);
+int handle = (segId << 16) | slot;
+handleToId.put(handle, id);
+return handle;
 }
 });
 }
 public double getLambdaByString(String itemId) {
 Integer handle = registry.get(itemId);
-if (handle == null) return 0.002;
+if (handle == null) return base;
 int segId = handle >>> 16;
 int slot = handle & SLOT_MASK;
 Segment seg = segments[segId];
 long offset = (long) slot * D_SIZE;
-long stamp = seg.lock.tryOptimisticRead();
-double lambda = seg.lambdas.get(D_LAYOUT, offset);
-if (!seg.lock.validate(stamp)) {
-stamp = seg.lock.readLock();
-try {
-lambda = seg.lambdas.get(D_LAYOUT, offset);
-} finally {
-seg.lock.unlockRead(stamp);
+synchronized (seg.lock) {
+return seg.lambdas.get(D_LAYOUT, offset);
 }
-}
-return lambda;
 }
 public void calculateBatch(int[] handles, double[] volumes, int count) {
 if (closed.get() || count == 0) return;
-CalcContext ctx = tlContext.get();
+CalcContext ctx = contextPool.acquire();
+try {
 ctx.reset();
 for (int i = 0; i < count; i++) {
 int h = handles[i];
@@ -1545,113 +1761,80 @@ if (ctx.counts[i] > 0) {
 processSegment(segments[i], ctx, i, now);
 }
 }
+} catch (IllegalStateException e) {
+plugin.getLogger().severe("PID Context Overflow: " + e.getMessage());
+} catch (Exception e) {
+plugin.getLogger().severe("PID Batch Error: " + e.getMessage());
+} finally {
+contextPool.release(ctx);
+}
 }
 private void processSegment(Segment seg, CalcContext ctx, int segId, long now) {
 int count = ctx.counts[segId];
 int[] slots = ctx.segSlots[segId];
-double[] vols = ctx.segVols[segId];
-long stamp = seg.lock.writeLock();
-try {
-MemorySegment msInt = seg.integrals;
-MemorySegment msErr = seg.errors;
-MemorySegment msLam = seg.lambdas;
-MemorySegment msTime = seg.times;
-MemorySegment msDirty = seg.dirty;
-int i = 0;
-int loopBound = SPECIES.loopBound(count);
+double[] localVols = ctx.segVols[segId];
 double[] vBuf = ctx.vBufState;
-for (; i < loopBound; i += V_LEN) {
-for (int lane = 0; lane < V_LEN; lane++) {
-int slotIdx = slots[i + lane];
-long offset = (long) slotIdx * D_SIZE;
-vBuf[lane]             = msInt.get(D_LAYOUT, offset);
-vBuf[lane + V_LEN]     = msErr.get(D_LAYOUT, offset);
-vBuf[lane + 2 * V_LEN] = msLam.get(D_LAYOUT, offset);
-long lastT             = msTime.get(L_LAYOUT, offset);
-vBuf[lane + 3 * V_LEN] = (now - lastT) * 0.001;
-}
-DoubleVector vIntegral = DoubleVector.fromArray(SPECIES, vBuf, 0);
-DoubleVector vLastErr  = DoubleVector.fromArray(SPECIES, vBuf, V_LEN);
-DoubleVector vLambda   = DoubleVector.fromArray(SPECIES, vBuf, 2 * V_LEN);
-DoubleVector vDt       = DoubleVector.fromArray(SPECIES, vBuf, 3 * V_LEN);
-DoubleVector vVol      = DoubleVector.fromArray(SPECIES, vols, i);
-vDt = vDt.max(V_DT_MIN).min(V_DT_MAX);
-DoubleVector vErrRaw = vVol.sub(V_TARGET);
-VectorMask<Double> maskDead = vErrRaw.abs().compare(VectorOperators.LT, V_DEADBAND);
-DoubleVector vErr = vErrRaw.blend(V_ZERO, maskDead);
-DoubleVector vD_Part = vErr.sub(vLastErr).div(vDt);
-DoubleVector vDecay = vDt.fma(V_NEG_TAU_INV, V_ONE);
-vIntegral = vIntegral.mul(vDecay);
-vIntegral = vErr.fma(vDt, vIntegral);
-vIntegral = vIntegral.max(V_I_MIN).min(V_I_MAX);
-VectorMask<Double> maskNeg = vErr.compare(VectorOperators.LT, V_ZERO);
-DoubleVector vKp = V_KP.blend(V_KP_NEG, maskNeg);
-DoubleVector vP = vErr.mul(vKp);
-DoubleVector vD = vD_Part.mul(V_KD);
-DoubleVector vI = vIntegral.mul(V_KI);
-DoubleVector vRaw = vP.add(vI).add(vD).add(V_BASE);
-vLambda = vLambda.fma(V_BETA, vRaw.mul(V_ALPHA));
-vLambda = vLambda.max(V_L_MIN).min(V_L_MAX);
-vIntegral.intoArray(vBuf, 0);
-vErr.intoArray(vBuf, V_LEN);
-vLambda.intoArray(vBuf, 2 * V_LEN);
-for (int lane = 0; lane < V_LEN; lane++) {
-int slotIdx = slots[i + lane];
-long offset = (long) slotIdx * D_SIZE;
-msInt.set(D_LAYOUT, offset, vBuf[lane]);
-msErr.set(D_LAYOUT, offset, vBuf[lane + V_LEN]);
-msLam.set(D_LAYOUT, offset, vBuf[lane + 2 * V_LEN]);
-msTime.set(L_LAYOUT, offset, now);
-msDirty.set(B_LAYOUT, (long) slotIdx, (byte) 1);
+synchronized (seg.lock) {
+for (int i = 0; i < count; i++) {
+long offset = (long) slots[i] * D_SIZE;
+vBuf[i] = seg.integrals.get(D_LAYOUT, offset);
+vBuf[i + count] = seg.errors.get(D_LAYOUT, offset);
+vBuf[i + count * 2] = seg.lambdas.get(D_LAYOUT, offset);
+vBuf[i + count * 3] = (now - seg.times.get(L_LAYOUT, offset)) * 0.001;
 }
 }
-for (; i < count; i++) {
-int slotIdx = slots[i];
-long offset = (long) slotIdx * D_SIZE;
-double dt = (now - msTime.get(L_LAYOUT, offset)) * 0.001;
-dt = Math.max(0.05, Math.min(1.0, dt));
-double integral = msInt.get(D_LAYOUT, offset);
-integral *= (1.0 - dt * 0.00001929);
-double vol = vols[i];
-double err = vol - 1000.0;
-if (Math.abs(err) < 20.0) err = 0.0;
-double kp = (err < 0) ? 0.000006 : 0.00001;
-integral = Math.fma(err, dt, integral);
-integral = Math.max(-30000, Math.min(30000, integral));
-double lastErr = msErr.get(D_LAYOUT, offset);
-double d = (err - lastErr) / dt * 0.00005;
-double raw = kp * err + integral * 0.000001 + d + 0.002;
-double lambda = msLam.get(D_LAYOUT, offset);
-lambda = Math.fma(lambda, 0.95, raw * 0.05);
-lambda = Math.max(0.0005, Math.min(0.01, lambda));
-msInt.set(D_LAYOUT, offset, integral);
-msErr.set(D_LAYOUT, offset, err);
-msLam.set(D_LAYOUT, offset, lambda);
-msTime.set(L_LAYOUT, offset, now);
-msDirty.set(B_LAYOUT, (long) slotIdx, (byte) 1);
+for (int i = 0; i < count; i += V_LEN) {
+VectorMask<Double> m = SPECIES.indexInRange(i, count);
+DoubleVector vI = DoubleVector.fromArray(SPECIES, vBuf, i, m);
+DoubleVector vE = DoubleVector.fromArray(SPECIES, vBuf, i + count, m);
+DoubleVector vL = DoubleVector.fromArray(SPECIES, vBuf, i + count * 2, m);
+DoubleVector vDtRaw = DoubleVector.fromArray(SPECIES, vBuf, i + count * 3, m);
+DoubleVector vVol = DoubleVector.fromArray(SPECIES, localVols, i, m);
+DoubleVector vDt = vDtRaw.max(vDtMin).min(vDtMax);
+DoubleVector vErrRaw = vVol.sub(vTarget);
+VectorMask<Double> maskDead = vErrRaw.abs().compare(VectorOperators.LT, vDeadband);
+DoubleVector vErr = vErrRaw.blend(vZero, maskDead);
+DoubleVector vDecay = vDt.fma(vNegTauInv, vOne);
+vI = vErr.fma(vDt, vI.mul(vDecay)).max(vIMin).min(vIMax);
+VectorMask<Double> maskNeg = vErr.compare(VectorOperators.LT, vZero);
+DoubleVector vKpUsed = vKp.blend(vKpNeg, maskNeg);
+DoubleVector vP = vErr.mul(vKpUsed);
+DoubleVector vD = vErr.sub(vE).div(vDt).mul(vKd);
+DoubleVector vRes = vP.add(vI.mul(vKi)).add(vD).add(vBase);
+vL = vL.fma(vBeta, vRes.mul(vAlpha)).max(vLMin).min(vLMax);
+vI.intoArray(vBuf, i, m);
+vErr.intoArray(vBuf, i + count, m);
+vL.intoArray(vBuf, i + count * 2, m);
 }
-} finally {
-seg.lock.unlockWrite(stamp);
+synchronized (seg.lock) {
+for (int k = 0; k < count; k++) {
+long offset = (long) slots[k] * D_SIZE;
+seg.integrals.set(D_LAYOUT, offset, vBuf[k]);
+seg.errors.set(D_LAYOUT, offset, vBuf[k + count]);
+seg.lambdas.set(D_LAYOUT, offset, vBuf[k + count * 2]);
+seg.times.set(L_LAYOUT, offset, now);
+seg.markDirty(slots[k]);
+}
 }
 }
 private static class Segment {
+final Object lock = new Object();
 @SuppressWarnings("unused")
-long p01, p02, p03, p04, p05, p06, p07;
-final StampedLock lock = new StampedLock();
-@SuppressWarnings("unused")
-long p11, p12, p13, p14, p15, p16, p17;
+private long p1, p2, p3, p4, p5, p6, p7;
 final MemorySegment integrals;
 final MemorySegment errors;
 final MemorySegment lambdas;
 final MemorySegment times;
-final MemorySegment dirty;
 final BitSet allocationMap = new BitSet(CAPACITY);
+private int[] dirtySlots;
+private int dirtyCount;
 Segment(Arena arena) {
 integrals = arena.allocate(D_LAYOUT, CAPACITY);
 errors = arena.allocate(D_LAYOUT, CAPACITY);
 lambdas = arena.allocate(D_LAYOUT, CAPACITY);
 times = arena.allocate(L_LAYOUT, CAPACITY);
-dirty = arena.allocate(B_LAYOUT, CAPACITY);
+this.dirtySlots = new int[64];
+this.dirtyCount = 0;
 warmup();
 }
 int allocateSlot() {
@@ -1663,38 +1846,86 @@ times.setAtIndex(L_LAYOUT, slot, System.currentTimeMillis());
 return slot;
 }
 void warmup() {
-for(int i=0; i<CAPACITY; i+=512) integrals.setAtIndex(D_LAYOUT, i, 0);
+for (int i = 0; i < CAPACITY; i += 512) {
+integrals.setAtIndex(D_LAYOUT, i, 0);
 }
+}
+void markDirty(int slot) {
+if (dirtyCount > 0 && dirtySlots[dirtyCount - 1] == slot) {
+return;
+}
+if (dirtyCount >= dirtySlots.length) {
+dirtySlots = Arrays.copyOf(dirtySlots, dirtySlots.length + 32);
+}
+dirtySlots[dirtyCount++] = slot;
+}
+}
+public static class DynamicCalcContextPool {
+private final ConcurrentLinkedQueue<CalcContext> pool = new ConcurrentLinkedQueue<>();
+private final AtomicInteger currentSize = new AtomicInteger(0);
+@SuppressWarnings("unused")
+private volatile int minSize;
+private volatile int maxSize;
+public DynamicCalcContextPool(int minSize, int maxSize) {
+this.minSize = minSize;
+this.maxSize = maxSize;
+for (int i = 0; i < minSize; i++) {
+pool.offer(new CalcContext());
+currentSize.incrementAndGet();
+}
+}
+public CalcContext acquire() {
+CalcContext ctx = pool.poll();
+if (ctx != null) {
+currentSize.decrementAndGet();
+} else {
+ctx = new CalcContext();
+}
+ctx.reset();
+return ctx;
+}
+public void release(CalcContext ctx) {
+if (currentSize.get() < maxSize) {
+pool.offer(ctx);
+currentSize.incrementAndGet();
+}
+}
+public int getAvailableCount() { return currentSize.get(); }
+public int getMinSize() { return minSize; }
+public void setMinSize(int newMin) { this.minSize = newMin;  }
+public int getMaxSize() { return maxSize; }
+public void setMaxSize(int newMax) { this.maxSize = newMax; }
 }
 private static class CalcContext {
 static final int INITIAL_CAPACITY = 512;
-static final int MAX_CAPACITY = 1024 * 1024;
+static final int HARD_LIMIT = 1024 * 1024;
 int[][] segSlots = new int[SEGMENT_COUNT][INITIAL_CAPACITY];
 double[][] segVols = new double[SEGMENT_COUNT][INITIAL_CAPACITY];
 final int[] counts = new int[SEGMENT_COUNT];
-final double[] vBufState = new double[4 * V_LEN];
+double[] vBufState;
+CalcContext() {
+this.vBufState = new double[INITIAL_CAPACITY * 4];
+}
 void reset() {
 Arrays.fill(counts, 0);
 }
 void push(int segId, int slot, double vol) {
-int idx = counts[segId]++;
+int idx = counts[segId];
 if (idx >= segSlots[segId].length) {
 grow(segId);
 }
 segSlots[segId][idx] = slot;
 segVols[segId][idx] = vol;
+counts[segId]++;
 }
 private void grow(int segId) {
 int oldCap = segSlots[segId].length;
-if (oldCap >= MAX_CAPACITY) throw new OutOfMemoryError("PID Context buffer limit");
-int newCap = oldCap + (oldCap >> 1);
-if (newCap > MAX_CAPACITY) newCap = MAX_CAPACITY;
-int[] newSlots = new int[newCap];
-double[] newVols = new double[newCap];
-System.arraycopy(segSlots[segId], 0, newSlots, 0, oldCap);
-System.arraycopy(segVols[segId], 0, newVols, 0, oldCap);
-segSlots[segId] = newSlots;
-segVols[segId] = newVols;
+int newCap = Math.min(HARD_LIMIT, oldCap + (oldCap >> 1));
+segSlots[segId] = Arrays.copyOf(segSlots[segId], newCap);
+segVols[segId] = Arrays.copyOf(segVols[segId], newCap);
+if (vBufState.length < newCap * 4) {
+vBufState = new double[newCap * 4];
+}
 }
 }
 @Override
@@ -1707,57 +1938,41 @@ public int getCacheSize() {
 return registry.size();
 }
 public int getDirtyQueueSize() {
-int totalDirty = 0;
+int total = 0;
 for (Segment seg : segments) {
-long stamp = seg.lock.readLock();
-try {
-for (int i = seg.allocationMap.nextSetBit(0); i >= 0; i = seg.allocationMap.nextSetBit(i + 1)) {
-if (seg.dirty.get(B_LAYOUT, (long) i) == (byte) 1) {
-totalDirty++;
+total += seg.dirtyCount;
 }
-}
-} finally {
-seg.lock.unlockRead(stamp);
-}
-}
-return totalDirty;
+return total;
 }
 public void flushBuffer(boolean sync) {
 if (closed.get()) return;
 List<DatabaseManager.PidDbSnapshot> batch = new ArrayList<>();
 for (int segId = 0; segId < SEGMENT_COUNT; segId++) {
 Segment seg = segments[segId];
-long stamp = seg.lock.writeLock();
-try {
-for (int i = seg.allocationMap.nextSetBit(0); i >= 0; i = seg.allocationMap.nextSetBit(i + 1)) {
-if (seg.dirty.get(B_LAYOUT, (long) i) == (byte) 1) {
-seg.dirty.set(B_LAYOUT, (long) i, (byte) 0);
-int targetHandle = (segId << 16) | i;
-String itemId = findIdByHandle(targetHandle);
-if (itemId != null) {
-long offset = (long) i * D_SIZE;
+int[] slotsToFlush;
+int countToFlush;
+synchronized (seg.lock) {
+if (seg.dirtyCount == 0) continue;
+slotsToFlush = seg.dirtySlots;
+countToFlush = seg.dirtyCount;
+seg.dirtySlots = new int[64];
+seg.dirtyCount = 0;
+}
+for (int k = 0; k < countToFlush; k++) {
+int slot = slotsToFlush[k];
+String id = handleToId.get((segId << 16) | slot);
+if (id != null) {
+long offset = (long) slot * D_SIZE;
 batch.add(new DatabaseManager.PidDbSnapshot(
-itemId,
-seg.integrals.get(D_LAYOUT, offset),
-seg.errors.get(D_LAYOUT, offset),
-seg.lambdas.get(D_LAYOUT, offset),
-seg.times.get(L_LAYOUT, offset)
+id, seg.integrals.get(D_LAYOUT, offset), seg.errors.get(D_LAYOUT, offset),
+seg.lambdas.get(D_LAYOUT, offset), seg.times.get(L_LAYOUT, offset)
 ));
 }
 }
-if (batch.size() >= 1000) break;
-}
-} finally {
-seg.lock.unlockWrite(stamp);
-}
-if (batch.size() >= 1000) break;
 }
 if (batch.isEmpty()) return;
-if (sync) {
-plugin.getDatabaseManager().saveBatch(batch);
-} else {
-Thread.ofVirtual().start(() -> plugin.getDatabaseManager().saveBatch(batch));
-}
+if (sync) plugin.getDatabaseManager().saveBatch(batch);
+else Thread.ofVirtual().name("eb-db-flush").start(() -> plugin.getDatabaseManager().saveBatch(batch));
 }
 public PidStateDto inspectState(String itemId) {
 Integer handle = registry.get(itemId);
@@ -1766,23 +1981,14 @@ int segId = handle >>> 16;
 int slot = handle & SLOT_MASK;
 Segment seg = segments[segId];
 long offset = (long) slot * D_SIZE;
-long stamp = seg.lock.readLock();
-try {
+synchronized (seg.lock) {
 return new PidStateDto(
 seg.integrals.get(D_LAYOUT, offset),
 seg.errors.get(D_LAYOUT, offset),
 seg.lambdas.get(D_LAYOUT, offset),
 seg.times.get(L_LAYOUT, offset)
 );
-} finally {
-seg.lock.unlockRead(stamp);
 }
-}
-private String findIdByHandle(int handle) {
-for (var entry : registry.entrySet()) {
-if (entry.getValue() == handle) return entry.getKey();
-}
-return null;
 }
 public record PidStateDto(double integral, double lastError, double lastLambda, long updateTime) {}
 public void loadAllStates() {
@@ -1794,16 +2000,248 @@ int segId = handle >>> 16;
 int slot = handle & SLOT_MASK;
 Segment seg = segments[segId];
 long offset = (long) slot * D_SIZE;
-long stamp = seg.lock.writeLock();
-try {
+synchronized (seg.lock) {
 seg.integrals.set(D_LAYOUT, offset, snapshot.integral());
 seg.errors.set(D_LAYOUT, offset, snapshot.lastError());
 seg.lambdas.set(D_LAYOUT, offset, snapshot.lastLambda());
 seg.times.set(L_LAYOUT, offset, snapshot.updateTime());
-seg.dirty.set(B_LAYOUT, (long) slot, (byte) 0);
-} finally {
-seg.lock.unlockWrite(stamp);
+seg.markDirty(slot);
 }
 });
+}
+}
+
+==================================================
+FILE: EcoBridge_Project\src\main\java\top\ellan\ecobridge\TradeMetadata.java
+==================================================
+
+package top.ellan.ecobridge;
+public record TradeMetadata(
+String technicalId,
+String displayName,
+String shopName
+) {}
+
+==================================================
+FILE: EcoBridge_Project\src\main\java\top\ellan\ecobridge\WebManager.java
+==================================================
+
+package top.ellan.ecobridge;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.atomic.DoubleAccumulator;
+import java.util.concurrent.atomic.LongAccumulator;
+import java.util.concurrent.locks.LockSupport;
+public class WebManager {
+private final EcoBridge plugin;
+private volatile boolean running = true;
+private final String nodeApiUrl;
+private static final int MAX_BATCH_SIZE = 64;
+private static final long FLUSH_INTERVAL_MS = 50;
+private final int capacity;
+private final int indexMask;
+private final long[] tsBuffer;
+private final double[] infBuffer;
+private final double[] tpsBuffer;
+private final int[] memBuffer;
+private final int[] threadBuffer;
+private static final VarHandle WRITE_CURSOR;
+static {
+try {
+MethodHandles.Lookup l = MethodHandles.lookup();
+WRITE_CURSOR = l.findVarHandle(WebManager.class, "writeSequence", long.class);
+} catch (ReflectiveOperationException e) {
+throw new ExceptionInInitializerError(e);
+}
+}
+@SuppressWarnings("unused")
+private long p1, p2, p3, p4, p5, p6, p7;
+@SuppressWarnings("unused")
+private volatile long writeSequence;
+@SuppressWarnings("unused")
+private long p8, p9, p10, p11, p12, p13, p14, p15;
+private volatile long readSequence = 0L;
+private final LockFreeAggregator aggregator;
+private final ExecutorService httpClientExecutor;
+private final HttpClient httpClient;
+private Thread senderThread;
+private final LongAdder errorCounter = new LongAdder();
+public WebManager(EcoBridge plugin) {
+this.plugin = plugin;
+this.nodeApiUrl = plugin.getConfig().getString("web.node-api-url", "http:
+this.httpClientExecutor = Executors.newVirtualThreadPerTaskExecutor();
+this.httpClient = HttpClient.newBuilder()
+.version(HttpClient.Version.HTTP_2)
+.executor(httpClientExecutor)
+.connectTimeout(Duration.ofSeconds(5))
+.build();
+int configCap = plugin.getConfig().getInt("web.history-capacity", 1024);
+this.capacity = Integer.highestOneBit(configCap) == configCap ? configCap : Integer.highestOneBit(configCap) << 1;
+this.indexMask = capacity - 1;
+this.tsBuffer = new long[capacity];
+this.infBuffer = new double[capacity];
+this.tpsBuffer = new double[capacity];
+this.memBuffer = new int[capacity];
+this.threadBuffer = new int[capacity];
+this.aggregator = new LockFreeAggregator(plugin);
+startBatchSender();
+plugin.getLogger().info("[Web] Production Build Initialized | Buffer: " + capacity + " | VThread Executor Active");
+}
+public void pushMetrics(double inflation, PerformanceMonitor.MonitorStats stats) {
+if (!running) return;
+long seq = (long) WRITE_CURSOR.getAndAddRelease(this, 1L);
+long lag = seq - readSequence;
+if (lag >= capacity) {
+readSequence = seq - capacity + 1;
+}
+int idx = (int) (seq & indexMask);
+tsBuffer[idx] = System.currentTimeMillis();
+infBuffer[idx] = inflation;
+tpsBuffer[idx] = stats.tps();
+memBuffer[idx] = (int) stats.memoryUsedMB();
+threadBuffer[idx] = stats.threadCount();
+VarHandle.releaseFence();
+aggregator.observe(stats.tps(), stats.memoryUsedMB());
+}
+private void startBatchSender() {
+this.senderThread = Thread.ofVirtual()
+.name("web-batch-sender")
+.start(this::batchSendLoop);
+}
+private void batchSendLoop() {
+long lastFlushTime = System.currentTimeMillis();
+while (running) {
+long writeSeq = (long) WRITE_CURSOR.getAcquire(this);
+long available = writeSeq - readSequence;
+if (available <= 0) {
+LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(200));
+continue;
+}
+int batchSize = (int) Math.min(available, MAX_BATCH_SIZE);
+String payload = buildBatchJson(readSequence, batchSize);
+try {
+HttpRequest request = HttpRequest.newBuilder()
+.uri(URI.create(nodeApiUrl))
+.header("Content-Type", "application/json")
+.POST(HttpRequest.BodyPublishers.ofString(payload))
+.timeout(Duration.ofSeconds(2))
+.build();
+HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+if (response.statusCode() == 200) {
+readSequence += batchSize;
+} else {
+handleError("Status " + response.statusCode());
+}
+} catch (Exception e) {
+handleError(e.getMessage());
+}
+long now = System.currentTimeMillis();
+if (now - lastFlushTime < FLUSH_INTERVAL_MS) {
+if (available <= MAX_BATCH_SIZE * 2) {
+LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(200));
+}
+} else {
+lastFlushTime = now;
+}
+}
+}
+private String buildBatchJson(long startSeq, int size) {
+StringBuilder sb = new StringBuilder(32 + size * 80);
+sb.append("{\"batch\":[");
+for (int i = 0; i < size; i++) {
+int idx = (int) ((startSeq + i) & indexMask);
+sb.append('{')
+.append("\"ts\":").append(tsBuffer[idx]).append(',')
+.append("\"inf\":").append(infBuffer[idx]).append(',')
+.append("\"tps\":").append(tpsBuffer[idx]).append(',')
+.append("\"mem\":").append(memBuffer[idx]).append(',')
+.append("\"threads\":").append(threadBuffer[idx])
+.append('}');
+if (i < size - 1) sb.append(',');
+}
+sb.append("]}");
+return sb.toString();
+}
+private void handleError(String reason) {
+errorCounter.increment();
+long count = errorCounter.sum();
+if ((count & 0xFF) == 0) {
+plugin.getLogger().warning("[Web] Push failed x256. Reason: " + reason);
+}
+}
+public void shutdown() {
+running = false;
+if (senderThread != null) {
+LockSupport.unpark(senderThread);
+senderThread.interrupt();
+}
+if (httpClientExecutor != null) {
+httpClientExecutor.shutdown();
+try {
+if (!httpClientExecutor.awaitTermination(1, TimeUnit.SECONDS)) {
+httpClientExecutor.shutdownNow();
+}
+} catch (InterruptedException e) {
+httpClientExecutor.shutdownNow();
+}
+}
+aggregator.reset();
+plugin.getLogger().info("[Web] Production Build Shutdown Gracefully");
+}
+public static class LockFreeAggregator {
+private final DoubleAccumulator minTps = new DoubleAccumulator(Math::min, 20.0);
+private final DoubleAccumulator maxTps = new DoubleAccumulator(Math::max, 0.0);
+private final LongAccumulator maxMemory = new LongAccumulator(Math::max, 0L);
+private static final VarHandle LAST_RESET;
+static {
+try {
+MethodHandles.Lookup l = MethodHandles.lookup();
+LAST_RESET = l.findVarHandle(LockFreeAggregator.class, "lastResetTime", long.class);
+} catch (ReflectiveOperationException e) {
+throw new ExceptionInInitializerError(e);
+}
+}
+@SuppressWarnings("unused")
+private volatile long lastResetTime = System.currentTimeMillis();
+private final long windowSizeMs;
+private final EcoBridge plugin;
+public LockFreeAggregator(EcoBridge plugin) {
+this.plugin = plugin;
+this.windowSizeMs = TimeUnit.MINUTES.toMillis(5);
+}
+public void observe(double tps, long memory) {
+long now = System.currentTimeMillis();
+long lastReset = (long) LAST_RESET.getOpaque(this);
+if (now - lastReset > windowSizeMs) {
+if (LAST_RESET.compareAndSet(this, lastReset, now)) {
+resetStats();
+}
+}
+minTps.accumulate(tps);
+maxTps.accumulate(tps);
+maxMemory.accumulate(memory);
+}
+public double getMinTps() { return minTps.get(); }
+public double getMaxTps() { return maxTps.get(); }
+public long getMaxMemory() { return maxMemory.get(); }
+private void resetStats() {
+minTps.reset();
+maxTps.reset();
+maxMemory.reset();
+plugin.getLogger().fine("[Web] Aggregator reset");
+}
+public void reset() {
+LAST_RESET.setRelease(this, System.currentTimeMillis());
+resetStats();
+}
 }
 }

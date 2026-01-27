@@ -1,4 +1,25 @@
 {
     "java.configuration.updateBuildConfiguration": "automatic",
-    "java.compile.nullAnalysis.mode": "automatic"
+    "java.compile.nullAnalysis.mode": "automatic",
+    
+    // 1. 确保语言服务器本身开启预览模式
+    "java.jdt.ls.vmargs": "--enable-preview",
+
+    // 2. 核心：指定运行时和编译器兼容性
+    "java.configuration.runtime": [
+        {
+            "name": "JavaSE-25",
+            "path": "D:\\Program Files\\Java\\graalvm-jdk-25.0.2+10.1",
+            "default": true
+        }
+    ],
+
+    // 3. 建议添加：强制编译器使用预览特性（针对没有使用 Maven/Gradle 的简单项目）
+    "java.jdt.ls.java.home": "D:\\Program Files\\Java\\graalvm-jdk-25.0.2+10.1",
+    
+    // 4. 如果是 Maven 项目，请确保 pom.xml 也有配置，
+    // 如果是普通项目，可以手动指定编译器参数
+    "java.project.compilerArgs": [
+        "--enable-preview"
+    ]
 }

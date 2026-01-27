@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.LongAdder;
 public class PerformanceMonitor {
     
     private final EcoBridge plugin;
+    private final PidController pidController;
     private final ScheduledExecutorService scheduler;
     private BukkitTask syncCacheTask;
     
@@ -28,9 +29,9 @@ public class PerformanceMonitor {
     
     // ==================== JVM 监控 Bean ====================
     private final MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
-    private final ThreadMXBean threadBean = ManagementFactory.getThreadMXBean(); // [Fix] 现在被使用了
-    private GarbageCollectorMXBean youngGC; // [Fix] 现在被使用了
-    private GarbageCollectorMXBean oldGC;   // [Fix] 现在被使用了
+    private final ThreadMXBean threadBean = ManagementFactory.getThreadMXBean();
+    private GarbageCollectorMXBean youngGC;
+    private GarbageCollectorMXBean oldGC;
     
     // ==================== 缓存状态 ====================
     private volatile double[] cachedTps = new double[]{20.0, 20.0, 20.0};
@@ -40,27 +41,19 @@ public class PerformanceMonitor {
     private volatile long simdBandwidth = 0;
     private volatile int vectorLanes = 0;
     
-    public PerformanceMonitor(EcoBridge plugin) {
+    public PerformanceMonitor(EcoBridge plugin, PidController pidController) {
         this.plugin = plugin;
+        this.pidController = pidController; 
         
-        // 1. Config (Main Thread)
         this.logInterval = plugin.getConfig().getInt("monitoring.log-interval", 300);
-        
-        // 2. JVM Beans
         detectGCBeans();
         
-        // 3. Scheduler
         this.scheduler = Executors.newSingleThreadScheduledExecutor(
             r -> Thread.ofVirtual().name("EcoBridge-Monitor").unstarted(r)
         );
         
-        // 4. Sync Task for Bukkit API
         this.syncCacheTask = Bukkit.getScheduler().runTaskTimer(plugin, this::updateServerStateCache, 100L, 100L);
-        
-        // 5. Benchmark
         benchmarkSIMD();
-        
-        // 6. Start Monitor
         startMonitoring();
     }
 
@@ -140,15 +133,14 @@ public class PerformanceMonitor {
             double ratio = total > 0 ? (100.0 * simd / total) : 0.0;
             report.append(String.format(" §7SIMD: §f%d lanes §7| Ratio: §a%.1f%%\n", vectorLanes, ratio));
             
-            // --- 2. 内存 & 线程 (使用 threadBean) ---
+            // --- 2. 内存 & 线程 ---
             MemoryUsage heap = memoryBean.getHeapMemoryUsage();
             long used = heap.getUsed() / 1048576;
             long max = heap.getMax() / 1048576;
-            // [Fix] 使用 threadBean 统计线程数
             report.append(String.format(" §7Mem: §e%dMB/%dMB §7| Threads: §f%d\n", 
                 used, max, threadBean.getThreadCount()));
             
-            // --- 3. GC 统计 (使用 youngGC/oldGC) ---
+            // --- 3. GC 统计 ---
             if (youngGC != null) {
                 report.append(String.format(" §7GC(Young): §f%d runs §7| §e%dms\n", 
                     youngGC.getCollectionCount(), youngGC.getCollectionTime()));
@@ -161,7 +153,12 @@ public class PerformanceMonitor {
             // --- 4. Server 状态 ---
             report.append(String.format(" §7TPS: §a%.1f §7| Players: §f%d\n", cachedTps[0], cachedPlayerCount));
             
-            // --- 5. 数据库 & 热点 ---
+            // --- 5. Context Pool ---
+            if (pidController != null) {
+                report.append(String.format(" §7ContextPool: §f%d available\n", pidController.getContextPool().getAvailableCount()));
+            }
+            
+            // --- 6. 数据库 & 热点 ---
             report.append(String.format(" §7DB IO: §fW:%,d R:%,d\n", dbWrites.sumThenReset(), dbReads.sumThenReset()));
             
             if (!counters.isEmpty()) {
@@ -187,6 +184,11 @@ public class PerformanceMonitor {
     
     // ==================== 辅助类 ====================
     
+    /**
+     * 监控统计数据记录类，用于传递给 WebManager
+     */
+    public record MonitorStats(double tps, long memoryUsedMB, int threadCount) {}
+
     public static class PerformanceCounter {
         private final AtomicLong totalNs = new AtomicLong(0);
         private final AtomicLong count = new AtomicLong(0);
@@ -221,6 +223,18 @@ public class PerformanceMonitor {
     public void stopTimer(String name, long startNs) {
         PerformanceCounter c = counters.get(name);
         if (c != null) c.record(System.nanoTime() - startNs);
+    }
+
+    /**
+     * 获取当前瞬间的服务器状态快照 (供 WebManager 使用)
+     */
+    public MonitorStats getCurrentStats() {
+        MemoryUsage heap = memoryBean.getHeapMemoryUsage();
+        return new MonitorStats(
+            cachedTps[0],
+            heap.getUsed() / 1048576,
+            threadBean.getThreadCount()
+        );
     }
     
     public void shutdown() {

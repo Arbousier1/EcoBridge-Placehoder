@@ -30,22 +30,22 @@ repositories {
 dependencies {
     // 1. 核心开发环境
     paperweight.paperDevBundle("1.21.11-R0.1-SNAPSHOT")
-
+    
     // 2. 外部插件依赖
     compileOnly("me.clip:placeholderapi:2.11.6")
     compileOnly("su.nightexpress.coinsengine:CoinsEngine:2.6.0")
     compileOnly("su.nightexpress.nightcore:main:2.13.0")
     compileOnly("cn.superiormc.ultimateshop:plugin:4.2.3")
-
+    compileOnly("com.github.luben:zstd-jni:1.5.6-2")
+    
     // 本地 libs
     compileOnly(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
-
+    
     // 3. 知识提取/数据处理库
     implementation(platform("com.fasterxml.jackson:jackson-bom:2.17.0"))
     implementation("com.fasterxml.jackson.core:jackson-databind")
     implementation("com.fasterxml.jackson.core:jackson-core")
     implementation("com.fasterxml.jackson.core:jackson-annotations")
-
     implementation("redis.clients:jedis:5.2.0")
     implementation("com.zaxxer:HikariCP:7.0.2")
     implementation("com.github.ben-manes.caffeine:caffeine:3.2.3")
@@ -62,7 +62,15 @@ tasks {
             "--add-modules=jdk.incubator.vector"
         ))
     }
-
+    
+    // [新增] 配置测试任务以支持预览特性
+    test {
+        jvmArgs(
+            "--enable-preview",
+            "--add-modules=jdk.incubator.vector"
+        )
+    }
+    
     processResources {
         val props = mapOf("version" to version)
         inputs.properties(props)
@@ -71,19 +79,19 @@ tasks {
             expand(props)
         }
     }
-
+    
     // ShadowJar 配置
     named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar") {
         archiveClassifier.set("")
         val prefix = "top.ellan.ecobridge.libs"
-
+        
         relocate("com.fasterxml.jackson", "$prefix.jackson")
         relocate("com.zaxxer.hikari", "$prefix.hikari")
         relocate("redis.clients", "$prefix.jedis")
         relocate("org.apache.commons.pool2", "$prefix.commons.pool2")
         relocate("org.json", "$prefix.json")
         relocate("com.github.benmanes.caffeine", "$prefix.caffeine")
-
+        
         exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
         exclude("META-INF/maven/**")
         
@@ -94,5 +102,13 @@ tasks {
     
     build {
         dependsOn("shadowJar")
+    }
+    
+    // [新增] 配置 runServer 任务以支持预览特性
+    named<xyz.jpenilla.runtask.task.AbstractRun>("runServer") {
+        jvmArgs(
+            "--enable-preview",
+            "--add-modules=jdk.incubator.vector"
+        )
     }
 }

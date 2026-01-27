@@ -1,23 +1,32 @@
 name: EcoBridge
-version: ${version}
+version: '2.0.0'
 main: top.ellan.ecobridge.EcoBridge
-api-version: 1.21
+api-version: '1.21'
+prefix: EcoBridge
 authors: [Ellan]
-website: https://github.com/Ellan/EcoBridge
+description: "Java 25 Extreme Performance Economy Controller"
+website: "https://github.com/Ellan/EcoBridge"
 
-depend:
-  - PlaceholderAPI
+# 软依赖：确保这些插件在 EcoBridge 之前加载（如果存在）
+softdepend:
   - CoinsEngine
   - UltimateShop
+  - PlaceholderAPI
+
+# 库加载：Paper 1.19+ 支持自动下载 Maven 库（可选，或使用 ShadowJar 打包）
+# 这里的配置是为了让 Paper 知道我们需要这些库，但我们在 Gradle 中使用 ShadowJar 会更稳妥
+# libraries:
+#   - com.zaxxer:HikariCP:5.1.0
+#   - com.github.luben:zstd-jni:1.5.5-11
 
 commands:
   ecobridge:
-    description: EcoBridge 经济调控系统核心指令
-    usage: /eb help
-    permission: ecobridge.admin
+    description: EcoBridge 主管理命令
+    usage: /ecobridge <subcommand>
     aliases: [eb, eco]
+    permission: ecobridge.admin
 
 permissions:
   ecobridge.admin:
-    description: 允许使用重载、调试和数据查看功能
+    description: 允许完全控制 EcoBridge 系统
     default: op

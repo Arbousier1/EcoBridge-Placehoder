@@ -73,19 +73,25 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
     }
 
     private void handleReload(CommandSender sender) {
-        msg(sender, "<yellow>⟳ 正在异步重载全系统模块（含 PID 参数）...");
+        msg(sender, "<yellow>⟳ 正在重载系统模块...");
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             long start = System.currentTimeMillis();
             try {
                 plugin.reloadConfig();
 
-                // 重载 PID 参数
+                // 1. 重载 PID 参数 (纯配置读取，异步安全)
                 plugin.getPidController().reloadConfig();
 
-                // 重载其他模块
-                plugin.getIntegrationManager().syncShops();
+                // 2. [修复] 同步商店数据必须回主线程 (涉及 Bukkit API)
+                // 使用 CountDownLatch 或 Future 等待主线程完成，或者直接 fire-and-forget
+                // 这里为了简单，我们让它排队执行，不阻塞当前异步线程的计时
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    plugin.getIntegrationManager().syncShops();
+                });
+
+                // 3. 重载其他模块 (HTTP 请求/纯计算，异步安全)
                 plugin.getMarketManager().updateHolidayCache();
-                plugin.getMarketManager().updateEconomyMetrics();
+                plugin.getMarketManager().updateEconomyMetrics(); // 如果这里有非线程安全操作也需注意
                 plugin.getMarketManager().updateMarketFlux();
 
                 msg(sender, "<green>✓ 重载成功! 耗时: <white>" + (System.currentTimeMillis() - start) + "ms");

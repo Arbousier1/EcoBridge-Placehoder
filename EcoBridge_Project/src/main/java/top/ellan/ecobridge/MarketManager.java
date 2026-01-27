@@ -5,8 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.bukkit.Bukkit;
 import org.bukkit.Statistic;
 import org.bukkit.entity.Player;
-import su.nightexpress.coinsengine.CoinsEnginePlugin; // 修正导入
-import su.nightexpress.coinsengine.api.CoinsEngineAPI; // 修正导入
+import org.bukkit.plugin.Plugin;
+import su.nightexpress.coinsengine.CoinsEnginePlugin;
+import su.nightexpress.coinsengine.api.CoinsEngineAPI;
 import su.nightexpress.coinsengine.api.currency.Currency;
 import su.nightexpress.coinsengine.tops.TopEntry;
 import su.nightexpress.coinsengine.tops.TopManager;
@@ -25,10 +26,10 @@ import java.util.concurrent.atomic.AtomicReference;
 public class MarketManager {
     
     private final EcoBridge plugin;
-    // I/O 密集型任务 (HTTP, TopManager读取)
+    // I/O 密集型任务 (HTTP 请求, TopManager 内存读取)
     private final ExecutorService ioExecutor = Executors.newVirtualThreadPerTaskExecutor();
     
-    // 经济指标 (无锁引用)
+    // 经济指标 (原子引用，无锁读写)
     private final AtomicReference<Double> inflation = new AtomicReference<>(1.0);
     private final AtomicReference<Double> marketFlux = new AtomicReference<>(1.0);
     private final AtomicReference<Double> currentThreshold = new AtomicReference<>(100000.0);
@@ -44,13 +45,13 @@ public class MarketManager {
     private final ObjectMapper jsonMapper = new ObjectMapper();
     
     // CoinsEngine 引用
-    private CoinsEnginePlugin coinsEnginePlugin; // 修正类型
+    private CoinsEnginePlugin coinsEnginePlugin;
     private Currency currency;
     
     // 配置常量
     private static final double MIN_THRESH = 100000.0;
     private static final double INF_WEIGHT = 0.3;
-    private static final double PERCENTILE = 0.15; 
+    private static final double PERCENTILE = 0.15; // 前 15% 的玩家作为富人基准
     private static final String HOLIDAY_API_URL = "https://api.apihubs.cn/holiday/get";
     
     public MarketManager(EcoBridge plugin) {
@@ -65,19 +66,21 @@ public class MarketManager {
     }
     
     private void setupCoinsEngine() {
-        // 检查 API 是否加载
-        if (Bukkit.getPluginManager().isPluginEnabled("CoinsEngine") && CoinsEngineAPI.isLoaded()) {
-            this.coinsEnginePlugin = CoinsEngineAPI.plugin(); // 获取主类实例
+        Plugin tempPlugin = Bukkit.getPluginManager().getPlugin("CoinsEngine");
+        
+        // 检查插件是否存在且 API 已加载
+        if (tempPlugin instanceof CoinsEnginePlugin && tempPlugin.isEnabled() && CoinsEngineAPI.isLoaded()) {
+            this.coinsEnginePlugin = (CoinsEnginePlugin) tempPlugin;
             
             String currencyId = plugin.getConfig().getString("economy-settings.currency-id", "money");
             
-            // 使用 API 静态方法获取货币
+            // 使用 CoinsEngineAPI 静态方法获取货币对象
             this.currency = CoinsEngineAPI.getCurrency(currencyId);
             
             if (this.currency != null) {
                 plugin.getLogger().info("[Market] Hooked into CoinsEngine. Currency: " + currencyId);
                 
-                // 检查排行榜管理器是否存在 (通常在主类中暴露)
+                // 检查排行榜管理器是否可用
                 if (!coinsEnginePlugin.getTopManager().isPresent()) {
                     plugin.getLogger().warning("[Market] CoinsEngine 'Top' feature is disabled in config!");
                     plugin.getLogger().warning("[Market] Inflation calculation will be skipped.");
@@ -91,31 +94,30 @@ public class MarketManager {
     }
     
     /**
-     * 更新经济指标 (核心优化)
-     * 利用 CoinsEngine 内存排行榜直接计算
+     * 更新经济指标 (通胀率计算)
+     * 基于 CoinsEngine 内存排行榜 (Descending Sort Confirmed)
      */
     public void updateEconomyMetrics() {
         if (currency == null || coinsEnginePlugin == null) return;
         
         ioExecutor.submit(() -> {
             try {
-                // 获取 TopManager (从插件实例获取)
                 Optional<TopManager> topManagerOpt = coinsEnginePlugin.getTopManager();
-                
-                if (topManagerOpt.isEmpty()) return; // 排行榜功能未开启
+                if (topManagerOpt.isEmpty()) return;
                 
                 TopManager topManager = topManagerOpt.get();
                 
-                // 获取排行榜 (内存快照，无 IO)
+                // 获取排行榜 (API 保证返回已降序排列的 List)
                 List<TopEntry> entries = topManager.getTopEntries(currency);
                 
                 if (entries.isEmpty()) return;
                 
-                // 计算样本大小
                 int totalPlayers = entries.size();
                 
-                // 计算 15% 门槛
+                // 计算前 15% 的位置索引
+                // index 0 是最有钱的，index (total * 0.15) 是第 15% 处的玩家
                 int thresholdIndex = (int) Math.floor(totalPlayers * PERCENTILE);
+                // 边界检查
                 thresholdIndex = Math.max(0, Math.min(totalPlayers - 1, thresholdIndex));
                 
                 TopEntry thresholdEntry = entries.get(thresholdIndex);
@@ -124,12 +126,12 @@ public class MarketManager {
                 // 更新原子引用
                 currentThreshold.set(threshold);
                 
-                // 计算通胀率
+                // 计算通胀率: 基于对数增长，避免数值爆炸
                 double ratio = Math.max(1.0, threshold / MIN_THRESH);
                 double newInflation = 1.0 + (Math.log(ratio) * INF_WEIGHT);
                 inflation.set(newInflation);
                 
-                // 清理旧统计缓存
+                // 顺便清理旧的统计缓存
                 cleanupStatCache();
                 
                 plugin.getLogger().info(String.format(
@@ -142,10 +144,10 @@ public class MarketManager {
             }
         });
     }
-
+    
     /**
      * 计算个人系数 (Personal Factor)
-     * 使用 CoinsEngineAPI 静态方法获取余额
+     * 使用 CoinsEngineAPI 静态方法获取余额 (同步方法，但通常为内存读取)
      */
     public double calculatePersonalFactor(Player player) {
         if (player.isOp()) return 1.0;
@@ -155,13 +157,15 @@ public class MarketManager {
         
         double currentFactor = 1.0;
         
-        // 1. 富人税 (API 调用)
+        // 1. 富人税
         if (currency != null) {
+            // 注意: getBalance 是同步方法。对于在线玩家，CoinsEngine 通常有内存缓存，速度很快。
             double balance = CoinsEngineAPI.getBalance(player.getUniqueId(), currency);
             double threshold = currentThreshold.get();
             
             if (balance > threshold) {
                 double excess = balance - threshold;
+                // 对数税率曲线
                 double tax = Math.log10(excess + 10) * (maxTax / 10.0);
                 currentFactor += Math.min(tax, maxTax * 2);
             }
@@ -180,22 +184,29 @@ public class MarketManager {
         return Math.max(minFactor, currentFactor);
     }
 
-    // --- 辅助方法 (保持不变) ---
+    // --- 辅助方法 ---
 
+    /**
+     * 高性能统计数据获取 (双重缓存机制)
+     * 解决 Bukkit.getStatistic 必须在主线程调用的问题
+     */
     private int getCachedStatistic(Player player, Statistic stat) {
         UUID uid = player.getUniqueId();
         Map.Entry<Integer, Long> entry = statCache.get(uid);
         long now = System.currentTimeMillis();
         
+        // 1. 命中缓存且未过期 (5分钟)
         if (entry != null && (now - entry.getValue() < 300_000)) { 
             return entry.getKey();
         }
         
+        // 2. 如果在主线程，直接更新并返回
         if (Bukkit.isPrimaryThread()) {
             int val = player.getStatistic(stat);
             statCache.put(uid, Map.entry(val, now));
             return val;
         } else {
+            // 3. 如果在异步线程，调度主线程更新，并返回旧值(如果存在)或0
             Bukkit.getScheduler().runTask(plugin, () -> {
                 if (player.isOnline()) {
                     statCache.put(uid, Map.entry(player.getStatistic(stat), System.currentTimeMillis()));
@@ -212,6 +223,7 @@ public class MarketManager {
 
     public void updateMarketFlux() {
         long currentHour = System.currentTimeMillis() / 3600000L;
+        // 使用时间作为种子，全服统一波动
         Random rng = new Random(currentHour + "Salt".hashCode());
         
         double range = plugin.getConfig().getDouble("market-flux.normal-range", 0.05);
@@ -224,10 +236,12 @@ public class MarketManager {
     }
     
     public void updateActivityFactor() {
+        // 先在主线程获取 Bukkit 状态
         Bukkit.getScheduler().runTask(plugin, () -> {
             int online = Bukkit.getOnlinePlayers().size();
             double tps = Bukkit.getTPS()[0]; 
             
+            // 再去异步线程计算
             ioExecutor.submit(() -> {
                 double base = plugin.getConfig().getDouble("activity.base", 1.0);
                 double impact = plugin.getConfig().getDouble("activity.player-impact", 0.001);

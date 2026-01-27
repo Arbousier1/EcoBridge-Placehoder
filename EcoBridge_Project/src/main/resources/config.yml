@@ -1,25 +1,34 @@
-# 1. 数据库配置
+# ══════════════════════════════════════════════════════════════════════════════
+#  EcoBridge Configuration - Java 25 Extreme Performance Edition
+#  Version: 2.0.0 (SIMD + FFM + VirtualThreads)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ==================== 1. 数据库配置 (Database) ====================
 # 由 DatabaseManager 调用，支持高性能 HikariCP 线程池
 database:
   # 推荐使用 MariaDB 以获得最佳的原子性更新性能
+  # 注意：必须添加 allowMultiQueries=true 以支持批量 SQL 提交
   url: "jdbc:mariadb://localhost:3306/ecobridge?useUnicode=true&characterEncoding=utf8&allowMultiQueries=true&serverTimezone=UTC"
   user: "root"
   password: "your_password_here"
   
-  # HikariCP 核心连接池参数
+  # HikariCP 核心连接池参数 (针对虚拟线程优化)
   pool:
     maximum-size: 16          # 最大连接数 (建议设置为 CPU 物理核心数)
     minimum-idle: 4           # 最小空闲连接数
     connection-timeout: 10000 # 获取连接的超时时间 (ms)
     idle-timeout: 300000      # 连接在池内保持空闲的最大时间 (ms)
     max-lifetime: 1800000     # 连接物理存活的最大时间 (ms)
+    
+    # 调试选项：输出详细的数据库性能日志
+    debug-db: false
 
-# 2. 经济大环境配置
+# ==================== 2. 经济大环境配置 (Economy) ====================
 # 由 MarketManager 调用，对接 CoinsEngine 系统
 economy-settings:
-  currency-id: "ellan_gold"   # 货币内部注册 ID
+  currency-id: "ellan_gold"   # 货币内部注册 ID (必须与 CoinsEngine 一致)
   
-  # 财富排名与通胀阈值计算
+  # 财富排名与通胀阈值计算 (基于 CoinsEngine 排行榜)
   threshold:
     min-value: 100000.0       # 基础富人门槛，低于此资产不计入宏观影响
     percentile: 0.15          # 前 15% 的高资产玩家定义当前市场“富人线”
@@ -28,8 +37,8 @@ economy-settings:
   inflation:
     weight: 0.3               # 通胀对物价的影响权重 (0.0-1.0)
 
-# 3. 个人系数配置
-# 针对不同玩家特征的动态调价逻辑
+# ==================== 3. 个人系数配置 (Personal Factors) ====================
+# 针对不同玩家特征的动态调价逻辑 (PAPI: %eco_personal%)
 personal-factor:
   min-factor: 0.5             # 价格保护下限 (最低价格不低于 0.5x)
   
@@ -43,23 +52,23 @@ personal-factor:
     max-discount: 0.05        # 资深玩家最高优惠 (-5%)
     threshold-hours: 100      # 达到满级折扣所需的在线小时数
 
-# 4. 市场波动配置
-# 模拟宏观市场情绪抖动
+# ==================== 4. 市场波动配置 (Market Flux) ====================
+# 模拟宏观市场情绪抖动 (PAPI: %eco_flux%)
 market-flux:
   normal-range: 0.05          # 日常无事件状态下的波动 (±5%)
   event-range: 0.3            # 随机市场事件引发的剧烈波动 (±30%)
   event-chance: 0.1           # 触发大事件的概率 (10%)
 
-# 5. 活跃度系数
-# 基于服务器负载和实时 TPS 的保护补偿机制
+# ==================== 5. 活跃度系数 (Activity) ====================
+# 基于服务器负载和实时 TPS 的保护补偿机制 (PAPI: %eco_activity%)
 activity:
   base: 1.0                   # 基础活跃倍率
   player-impact: 0.001        # 每多一名玩家在线，物价上浮 0.1%
   tps-limit: 18.0             # 性能红线：TPS 低于此值时视为卡顿
   tps-weight: 0.05            # TPS 惩罚权重：每降 1 点 TPS 对应的调价幅度
 
-# 6. 现实节假日系数
-# 自动抓取法定节假日数据进行价格刺激同步
+# ==================== 6. 现实节假日系数 (Holidays) ====================
+# 自动抓取法定节假日数据进行价格刺激同步 (PAPI: %eco_holiday%)
 holidays:
   api-url: "https://api.apihubs.cn/holiday/get"
   cache-duration: 86400000    # 本地缓存有效期 (24小时)
@@ -72,7 +81,7 @@ holidays:
     compensation: 1.2         # 调休上班日
     other: 0.9                # 异常特殊时段
 
-# ==================== 7. PID 控制器核心配置 ====================
+# ==================== 7. PID 控制器核心配置 (PID Engine) ====================
 # 这里的参数由 PidController 动态向量化加载，直接影响 SIMD 引擎的计算结果
 pid:
   target: 1000.0              # 目标结算量：每个物品在每个周期的期望成交频率
@@ -98,18 +107,18 @@ pid:
   dt-max: 1.0                 # 计算步长最大限制 (秒)
   dt-min: 0.05                # 计算步长最小限制 (秒)
 
-# 8. 性能优化配置
+# ==================== 8. 性能优化配置 (Performance) ====================
 performance:
   virtual-threads: true       # 启用 Java 25 虚拟线程执行数据库 IO
   memory-warmup: true         # 启动时预热 FFM 堆外内存，防止首次访问延迟
   gc-friendly: true           # 启用缓冲池复用，实现 Zero-GC 高频采集
   
-  # 调试日志
+  # 调试日志 (生产环境建议全部关闭)
   debug-perf: false           # 控制台打印每批次 SIMD 计算耗时
-  debug-db: false             # 打印数据库批量刷写的性能统计
   debug-simd: false           # 打印 SIMD 向量化指令的诊断信息
 
-# 9. 任务调度周期 (单位: Ticks, 20 ticks = 1秒)
+# ==================== 9. 任务调度周期 (Schedulers) ====================
+# 单位: Ticks (20 ticks = 1秒)
 schedulers:
   main-loop:
     initial-delay: 1200       # 启动 1 分钟后开启首轮调价
@@ -124,24 +133,25 @@ schedulers:
     initial-delay: 20
     period: 6000              # 每 5 分钟检查一次节假日
 
-# 10. 监控与指标配置
+# ==================== 10. 监控与 Web 服务配置 (Web & Monitoring) ====================
 monitoring:
-  enabled: true               # 启用性能监控系统
-  log-interval: 300           # 性能报告输出间隔 (秒)
-  
-  metrics:
-    - pid-calculations        # 核心计算次数
-    - simd-ratio              # SIMD 指令占比
-    - cache-hit-rate          # SoA 缓存命中率
-    - db-batch-size           # 数据库批处理大小
-    - memory-usage            # 堆内/堆外内存监控
-    - tps                     # TPS 稳定性监控
+  enabled: false              # 启用性能监控系统
+  log-interval: 300           # 控制台性能报告输出间隔 (秒)
 
-# 11. 兼容性与降级
+web:
+  # Node.js 后端 API 地址 (用于接收高性能数据流)
+  # EcoBridge 将通过 HTTP/2 协议将压缩的 JSON 数据推送至此
+  node-api-url: "http://localhost:3000/api/update"
+  
+  # 内存历史缓冲区大小 (必须是 2 的幂次方，如 256, 512, 1024)
+  # 用于平滑网络抖动，防止数据在发送前丢失
+  history-capacity: 1024
+
+# ==================== 11. 兼容性与降级 (Compatibility) ====================
 compatibility:
   ultimateshop: true          # 挂钩商店数据源
   placeholderapi: true        # PAPI 变量扩展
   coinsengine: true           # 货币系统集成核心
   
   fallback-on-error: true     # 若 CPU 不支持 SIMD 则自动降级到标量模式
-  safe-mode: false            # 安全模式 (禁用所有异步优化，仅用于排查)
+  safe-mode: false            # 安全模式 (禁用所有异步优化，仅用于排查崩溃)
