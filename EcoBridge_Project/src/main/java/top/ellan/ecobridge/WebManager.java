@@ -196,8 +196,8 @@ public class WebManager {
             int idx = (int) ((startSeq + i) & indexMask);
             sb.append('{')
               .append("\"ts\":").append(tsBuffer[idx]).append(',')
-              .append("\"inf\":").append(String.format("%.4f", infBuffer[idx])).append(',')
-              .append("\"tps\":").append(String.format("%.2f", tpsBuffer[idx])).append(',')
+              .append("\"inf\":").append(infBuffer[idx]).append(',')
+              .append("\"tps\":").append(tpsBuffer[idx]).append(',')
               .append("\"mem\":").append(memBuffer[idx]).append(',')
               .append("\"threads\":").append(threadBuffer[idx])
               .append('}');

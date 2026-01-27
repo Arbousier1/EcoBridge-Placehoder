@@ -115,6 +115,262 @@ maven("https://repo.papermc.io/repository/maven-public/")
 rootProject.name = "EcoBridge"
 
 ==================================================
+FILE: EcoBridge_Project\src\main\java\top\ellan\ecobridge\DatabaseManager.java
+==================================================
+
+package top.ellan.ecobridge;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
+public class DatabaseManager {
+public record PidDbSnapshot(String itemId, double integral, double lastError,
+double lastLambda, long updateTime) {}
+private final EcoBridge plugin;
+private HikariDataSource dataSource;
+private final BlockingQueue<PidDbSnapshot> pendingWrites = new LinkedBlockingQueue<>(20000);
+private final ScheduledExecutorService batchScheduler = Executors.newSingleThreadScheduledExecutor(
+Thread.ofVirtual().factory()
+);
+private final AtomicInteger optimalBatchSize = new AtomicInteger(500);
+private volatile boolean initialized = false;
+public DatabaseManager(EcoBridge plugin) {
+this.plugin = plugin;
+}
+public void initPool() {
+Thread.ofVirtual().start(() -> {
+try {
+HikariConfig config = buildConfig();
+this.dataSource = new HikariDataSource(config);
+warmupPool();
+createTable();
+startBatchWriter();
+initialized = true;
+plugin.getLogger().info("[DB] HikariCP initialized: " +
+config.getMaximumPoolSize() + " connections, VirtualThread enabled");
+plugin.getPidController().loadAllStates();
+} catch (Exception e) {
+plugin.getLogger().severe("[DB] Init failed: " + e.getMessage());
+e.printStackTrace();
+}
+});
+}
+private HikariConfig buildConfig() {
+HikariConfig config = new HikariConfig();
+String url = plugin.getConfig().getString("database.url",
+"jdbc:mariadb:
+String user = plugin.getConfig().getString("database.user", "root");
+String pass = plugin.getConfig().getString("database.password", "password");
+config.setJdbcUrl(url);
+config.setUsername(user);
+config.setPassword(pass);
+var pool = plugin.getConfig().getConfigurationSection("database.pool");
+if (pool != null) {
+config.setMaximumPoolSize(pool.getInt("maximum-size", 16));
+config.setMinimumIdle(pool.getInt("minimum-idle", 4));
+config.setConnectionTimeout(pool.getLong("connection-timeout", 10000L));
+config.setIdleTimeout(pool.getLong("idle-timeout", 300000L));
+config.setMaxLifetime(pool.getLong("max-lifetime", 1800000L));
+config.setKeepaliveTime(pool.getLong("keepalive-time", 60000L));
+config.setLeakDetectionThreshold(pool.getLong("leak-detection-threshold", 30000L));
+} else {
+config.setMaximumPoolSize(16);
+config.setMinimumIdle(4);
+config.setIdleTimeout(300000);
+config.setConnectionTimeout(10000);
+config.setMaxLifetime(1800000);
+config.setKeepaliveTime(60000);
+config.setLeakDetectionThreshold(30000);
+}
+config.setPoolName("EcoBridge-Hikari");
+config.addDataSourceProperty("cachePrepStmts", "true");
+config.addDataSourceProperty("prepStmtCacheSize", "500");
+config.addDataSourceProperty("prepStmtCacheSqlLimit", "4096");
+config.addDataSourceProperty("useServerPrepStmts", "true");
+config.addDataSourceProperty("useLocalSessionState", "true");
+config.addDataSourceProperty("rewriteBatchedStatements", "true");
+config.addDataSourceProperty("cacheResultSetMetadata", "true");
+config.addDataSourceProperty("cacheServerConfiguration", "true");
+config.addDataSourceProperty("elideSetAutoCommits", "true");
+config.addDataSourceProperty("maintainTimeStats", "false");
+config.addDataSourceProperty("useUnbufferedInput", "false");
+config.setThreadFactory(Thread.ofVirtual().factory());
+return config;
+}
+private void warmupPool() {
+try (Connection conn = dataSource.getConnection()) {
+try (Statement stmt = conn.createStatement()) {
+stmt.execute("SELECT 1");
+}
+plugin.getLogger().info("[DB] Connection pool warmed up");
+} catch (SQLException e) {
+plugin.getLogger().warning("[DB] Warmup failed: " + e.getMessage());
+}
+}
+private void createTable() throws SQLException {
+try (Connection conn = dataSource.getConnection();
+Statement stmt = conn.createStatement()) {
+stmt.execute("""
+CREATE TABLE IF NOT EXISTS eb_pid_states (
+item_id VARCHAR(64) PRIMARY KEY,
+integral DOUBLE NOT NULL DEFAULT 0,
+last_error DOUBLE NOT NULL DEFAULT 0,
+last_lambda DOUBLE NOT NULL DEFAULT 0.002,
+update_time BIGINT NOT NULL DEFAULT 0,
+INDEX idx_update_time (update_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+ROW_FORMAT=DYNAMIC
+""");
+plugin.getLogger().info("[DB] Table 'eb_pid_states' ready");
+}
+}
+private void startBatchWriter() {
+batchScheduler.scheduleAtFixedRate(() -> {
+try {
+flushPendingWrites();
+} catch (Exception e) {
+plugin.getLogger().log(Level.WARNING, "[DB] Batch write error", e);
+}
+}, 500, 500, TimeUnit.MILLISECONDS);
+}
+public void saveBatch(List<PidDbSnapshot> snapshots) {
+if (!initialized || snapshots.isEmpty()) return;
+if (snapshots.size() > 1000) {
+Thread.ofVirtual().start(() -> executeBatchWrite(snapshots));
+return;
+}
+pendingWrites.addAll(snapshots);
+}
+private void flushPendingWrites() {
+if (pendingWrites.isEmpty()) return;
+List<PidDbSnapshot> batch = new ArrayList<>(optimalBatchSize.get());
+pendingWrites.drainTo(batch, optimalBatchSize.get());
+if (!batch.isEmpty()) {
+executeBatchWrite(batch);
+}
+}
+private void executeBatchWrite(List<PidDbSnapshot> snapshots) {
+if (dataSource == null || dataSource.isClosed()) return;
+String sql = """
+INSERT INTO eb_pid_states (item_id, integral, last_error, last_lambda, update_time)
+VALUES (?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+integral = VALUES(integral),
+last_error = VALUES(last_error),
+last_lambda = VALUES(last_lambda),
+update_time = VALUES(update_time)
+""";
+long startNs = System.nanoTime();
+try (Connection conn = dataSource.getConnection()) {
+boolean originalAutoCommit = conn.getAutoCommit();
+conn.setAutoCommit(false);
+try (PreparedStatement ps = conn.prepareStatement(sql)) {
+for (PidDbSnapshot record : snapshots) {
+ps.setString(1, record.itemId());
+ps.setDouble(2, record.integral());
+ps.setDouble(3, record.lastError());
+ps.setDouble(4, record.lastLambda());
+ps.setLong(5, record.updateTime());
+ps.addBatch();
+}
+ps.executeBatch();
+conn.commit();
+long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
+adjustBatchSize(snapshots.size(), elapsedMs);
+if (plugin.getConfig().getBoolean("debug-db", false)) {
+plugin.getLogger().info(String.format(
+"[DB] Saved %d items in %dms (%.1f items/ms)",
+snapshots.size(), elapsedMs, snapshots.size() / (double) Math.max(1, elapsedMs)
+));
+}
+} catch (SQLException e) {
+conn.rollback();
+throw e;
+} finally {
+conn.setAutoCommit(originalAutoCommit);
+}
+} catch (SQLException e) {
+plugin.getLogger().log(Level.WARNING,
+"[DB] Batch save failed for " + snapshots.size() + " items", e);
+}
+}
+private void adjustBatchSize(int currentSize, long elapsedMs) {
+if (elapsedMs < 50) {
+optimalBatchSize.updateAndGet(old -> Math.min(2000, (int) (old * 1.2)));
+} else if (elapsedMs > 150) {
+optimalBatchSize.updateAndGet(old -> Math.max(100, (int) (old * 0.8)));
+}
+}
+public void loadStates(java.util.function.Consumer<PidDbSnapshot> consumer) {
+if (dataSource == null || dataSource.isClosed()) return;
+Thread.ofVirtual().start(() -> {
+try (Connection conn = dataSource.getConnection();
+Statement stmt = conn.createStatement()) {
+stmt.setFetchSize(1000);
+try (ResultSet rs = stmt.executeQuery("SELECT * FROM eb_pid_states")) {
+int count = 0;
+while (rs.next()) {
+consumer.accept(new PidDbSnapshot(
+rs.getString("item_id"),
+rs.getDouble("integral"),
+rs.getDouble("last_error"),
+rs.getDouble("last_lambda"),
+rs.getLong("update_time")
+));
+count++;
+}
+plugin.getLogger().info("[DB] Loaded " + count + " PID states from database");
+}
+} catch (SQLException e) {
+plugin.getLogger().severe("[DB] Failed to load states: " + e.getMessage());
+e.printStackTrace();
+}
+});
+}
+public void closePool() {
+plugin.getLogger().info("[DB] 正在执行优雅停机，清理待写入队列...");
+batchScheduler.shutdown();
+try {
+int totalFlushed = 0;
+while (!pendingWrites.isEmpty()) {
+List<PidDbSnapshot> finalBatch = new ArrayList<>(2000);
+pendingWrites.drainTo(finalBatch, 2000);
+if (!finalBatch.isEmpty()) {
+executeBatchWrite(finalBatch);
+totalFlushed += finalBatch.size();
+}
+}
+if (totalFlushed > 0) {
+plugin.getLogger().info("[DB] 停机前成功追加写入 " + totalFlushed + " 条记录");
+}
+if (!batchScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+batchScheduler.shutdownNow();
+}
+} catch (InterruptedException e) {
+batchScheduler.shutdownNow();
+Thread.currentThread().interrupt();
+}
+if (dataSource != null && !dataSource.isClosed()) {
+dataSource.close();
+plugin.getLogger().info("[DB] HikariCP 连接池已安全关闭");
+}
+}
+public HikariDataSource getDataSource() {
+return dataSource;
+}
+public boolean isInitialized() {
+return initialized;
+}
+public int getPendingWritesCount() {
+return pendingWrites.size();
+}
+}
+
+==================================================
 FILE: EcoBridge_Project\src\main\java\top\ellan\ecobridge\EcoBridge.java
 ==================================================
 
@@ -142,15 +398,17 @@ getLogger().info("════════════════════�
 try {
 saveDefaultConfig();
 initializeComponents();
-pidController.reloadConfig();
-databaseManager.initPool();
+if (pidController != null) pidController.reloadConfig();
+if (databaseManager != null) databaseManager.initPool();
+if (getConfig().getBoolean("monitoring.enabled", true)) {
+performanceMonitor = new PerformanceMonitor(this, pidController);
+getLogger().info("  ✓ Performance monitoring enabled");
+} else {
+getLogger().info("  - Performance monitoring disabled in config");
+}
 registerPlaceholderAPI();
 registerCommands();
 startSchedulers();
-if (getConfig().getBoolean("monitoring.enabled", true)) {
-performanceMonitor = new PerformanceMonitor(this, pidController);
-getLogger().info("Performance monitoring enabled");
-}
 warmupCriticalPaths();
 fullyInitialized = true;
 long elapsedMs = System.currentTimeMillis() - startTime;
@@ -255,8 +513,8 @@ public void run() {
 if (!fullyInitialized) return;
 try {
 integrationManager.collectDataAndCalculate();
-pidController.flushBuffer(false);
-marketManager.updateActivityFactor();
+if (pidController != null) pidController.flushBuffer(false);
+if (marketManager != null) marketManager.updateActivityFactor();
 } catch (Exception e) {
 getLogger().warning("[Scheduler] Main loop error: " + e.getMessage());
 }
@@ -270,7 +528,7 @@ new BukkitRunnable() {
 public void run() {
 if (!fullyInitialized) return;
 try {
-marketManager.updateEconomyMetrics();
+if (marketManager != null) marketManager.updateEconomyMetrics();
 } catch (Exception e) {
 getLogger().warning("[Scheduler] Economy update error: " + e.getMessage());
 }
@@ -284,8 +542,10 @@ new BukkitRunnable() {
 public void run() {
 if (!fullyInitialized) return;
 try {
+if (marketManager != null) {
 marketManager.updateMarketFlux();
 marketManager.updateHolidayCache();
+}
 } catch (Exception e) {
 getLogger().warning("[Scheduler] Market flux error: " + e.getMessage());
 }
@@ -297,9 +557,11 @@ long reportDelay = 1200L;
 new BukkitRunnable() {
 @Override
 public void run() {
-if (!fullyInitialized) return;
+if (!fullyInitialized || performanceMonitor == null || webManager == null) return;
 try {
-webManager.pushMetrics(marketManager.getInflation(), performanceMonitor.getCurrentStats());
+var stats = performanceMonitor.getCurrentStats();
+double inflation = (marketManager != null) ? marketManager.getInflation() : 1.0;
+webManager.pushMetrics(inflation, stats);
 } catch (Exception e) {
 getLogger().warning("[Scheduler] Report push error: " + e.getMessage());
 }
@@ -313,17 +575,26 @@ getLogger().info("Warming up critical paths...");
 Thread.ofVirtual().start(() -> {
 try {
 int retries = 0;
-while (!databaseManager.isInitialized() && retries++ < 50) {
+while (databaseManager != null && !databaseManager.isInitialized() && retries++ < 50) {
 Thread.sleep(100);
 }
-if (databaseManager.isInitialized()) {
+if (databaseManager != null && databaseManager.isInitialized()) {
+Bukkit.getScheduler().runTask(this, () -> {
+try {
+if (integrationManager != null) {
 integrationManager.syncShops();
-getLogger().info("  ✓ Shop data synced");
-pidController.loadAllStates();
+getLogger().info("  ✓ Shop data synced (Main Thread)");
+}
+} catch (Exception e) {
+getLogger().warning("Shop sync error: " + e.getMessage());
+}
+});
+if (marketManager != null) {
 marketManager.updateMarketFlux();
 marketManager.updateHolidayCache();
 getLogger().info("  ✓ Market data initialized");
-pidController.reloadConfig();
+}
+if (pidController != null) pidController.reloadConfig();
 getLogger().info("  ✓ Warmup complete");
 } else {
 getLogger().warning("  ⚠ Database not ready, skipping warmup");
@@ -341,7 +612,9 @@ if (pending == 0) {
 getLogger().info("  ✓ 数据库队列已排空，所有数据已落盘");
 return;
 }
+if ((System.currentTimeMillis() - startTime) % 1000 < 200) {
 getLogger().info("  → 数据库队列剩余: " + pending + " 条");
+}
 try {
 Thread.sleep(150);
 } catch (InterruptedException e) {
@@ -360,30 +633,14 @@ if (webManager != null) webManager.shutdown();
 } catch (Exception ignored) {
 }
 }
-public static EcoBridge getInstance() {
-return instance;
-}
-public DatabaseManager getDatabaseManager() {
-return databaseManager;
-}
-public PidController getPidController() {
-return pidController;
-}
-public MarketManager getMarketManager() {
-return marketManager;
-}
-public IntegrationManager getIntegrationManager() {
-return integrationManager;
-}
-public PerformanceMonitor getPerformanceMonitor() {
-return performanceMonitor;
-}
-public WebManager getWebManager() {
-return webManager;
-}
-public boolean isFullyInitialized() {
-return fullyInitialized;
-}
+public static EcoBridge getInstance() { return instance; }
+public DatabaseManager getDatabaseManager() { return databaseManager; }
+public PidController getPidController() { return pidController; }
+public MarketManager getMarketManager() { return marketManager; }
+public IntegrationManager getIntegrationManager() { return integrationManager; }
+public PerformanceMonitor getPerformanceMonitor() { return performanceMonitor; }
+public WebManager getWebManager() { return webManager; }
+public boolean isFullyInitialized() { return fullyInitialized; }
 }
 
 ==================================================
@@ -458,13 +715,15 @@ msg(sender, "  <gold>/eb benchmark confirm <dark_gray>• <gray>执行 5M 次 PI
 msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
 private void handleReload(CommandSender sender) {
-msg(sender, "<yellow>⟳ 正在异步重载全系统模块（含 PID 参数）...");
+msg(sender, "<yellow>⟳ 正在重载系统模块...");
 Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
 long start = System.currentTimeMillis();
 try {
 plugin.reloadConfig();
 plugin.getPidController().reloadConfig();
+Bukkit.getScheduler().runTask(plugin, () -> {
 plugin.getIntegrationManager().syncShops();
+});
 plugin.getMarketManager().updateHolidayCache();
 plugin.getMarketManager().updateEconomyMetrics();
 plugin.getMarketManager().updateMarketFlux();
@@ -797,11 +1056,7 @@ FILE: EcoBridge_Project\src\main\java\top\ellan\ecobridge\FastSnapshotManager.ja
 
 package top.ellan.ecobridge;
 import com.github.luben.zstd.Zstd;
-import org.bukkit.Bukkit;
 import java.io.*;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
@@ -812,10 +1067,8 @@ import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
-import java.util.zip.CRC32;
 public class FastSnapshotManager {
 private final EcoBridge plugin;
 private final Path dataDir;
@@ -959,7 +1212,7 @@ MappedByteBuffer compressedBuffer = channel.map(FileChannel.MapMode.READ_ONLY, 1
 ByteBuffer destBuffer = ByteBuffer.allocateDirect(uncompressedSize);
 long size = Zstd.decompressDirectByteBuffer(
 destBuffer, 0, uncompressedSize,
-compressedBuffer, 0, compressedSize
+compressedBuffer, 0, (int) compressedSize
 );
 if (size != uncompressedSize) throw new IOException("Decompression size mismatch");
 destBuffer.flip();
@@ -1194,6 +1447,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.bukkit.Bukkit;
 import org.bukkit.Statistic;
 import org.bukkit.entity.Player;
+import org.bukkit.plugin.Plugin;
 import su.nightexpress.coinsengine.CoinsEnginePlugin;
 import su.nightexpress.coinsengine.api.CoinsEngineAPI;
 import su.nightexpress.coinsengine.api.currency.Currency;
@@ -1237,8 +1491,9 @@ this.httpClient = HttpClient.newBuilder()
 setupCoinsEngine();
 }
 private void setupCoinsEngine() {
-if (Bukkit.getPluginManager().isPluginEnabled("CoinsEngine") && CoinsEngineAPI.isLoaded()) {
-this.coinsEnginePlugin = CoinsEngineAPI.plugin();
+Plugin tempPlugin = Bukkit.getPluginManager().getPlugin("CoinsEngine");
+if (tempPlugin instanceof CoinsEnginePlugin && tempPlugin.isEnabled() && CoinsEngineAPI.isLoaded()) {
+this.coinsEnginePlugin = (CoinsEnginePlugin) tempPlugin;
 String currencyId = plugin.getConfig().getString("economy-settings.currency-id", "money");
 this.currency = CoinsEngineAPI.getCurrency(currencyId);
 if (this.currency != null) {
@@ -1892,7 +2147,7 @@ currentSize.incrementAndGet();
 }
 public int getAvailableCount() { return currentSize.get(); }
 public int getMinSize() { return minSize; }
-public void setMinSize(int newMin) { this.minSize = newMin;  }
+public void setMinSize(int newMin) { this.minSize = newMin; }
 public int getMaxSize() { return maxSize; }
 public void setMaxSize(int newMax) { this.maxSize = newMax; }
 }
@@ -1933,6 +2188,9 @@ public void close() {
 if (closed.compareAndSet(false, true)) {
 if (arena.scope().isAlive()) arena.close();
 }
+}
+public DynamicCalcContextPool getContextPool() {
+return contextPool;
 }
 public int getCacheSize() {
 return registry.size();
@@ -2037,9 +2295,9 @@ import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.atomic.DoubleAccumulator;
 import java.util.concurrent.atomic.LongAccumulator;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 public class WebManager {
 private final EcoBridge plugin;
@@ -2092,17 +2350,13 @@ this.infBuffer = new double[capacity];
 this.tpsBuffer = new double[capacity];
 this.memBuffer = new int[capacity];
 this.threadBuffer = new int[capacity];
-this.aggregator = new LockFreeAggregator(plugin);
+this.aggregator = new LockFreeAggregator();
 startBatchSender();
 plugin.getLogger().info("[Web] Production Build Initialized | Buffer: " + capacity + " | VThread Executor Active");
 }
 public void pushMetrics(double inflation, PerformanceMonitor.MonitorStats stats) {
 if (!running) return;
 long seq = (long) WRITE_CURSOR.getAndAddRelease(this, 1L);
-long lag = seq - readSequence;
-if (lag >= capacity) {
-readSequence = seq - capacity + 1;
-}
 int idx = (int) (seq & indexMask);
 tsBuffer[idx] = System.currentTimeMillis();
 infBuffer[idx] = inflation;
@@ -2122,11 +2376,21 @@ long lastFlushTime = System.currentTimeMillis();
 while (running) {
 long writeSeq = (long) WRITE_CURSOR.getAcquire(this);
 long available = writeSeq - readSequence;
+if (available > capacity) {
+plugin.getLogger().warning("[Web] Buffer overflow! Dropping " + (available - capacity) + " metrics.");
+readSequence = writeSeq - capacity;
+available = capacity;
+}
 if (available <= 0) {
 LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(200));
 continue;
 }
 int batchSize = (int) Math.min(available, MAX_BATCH_SIZE);
+long now = System.currentTimeMillis();
+if (batchSize < MAX_BATCH_SIZE && (now - lastFlushTime < FLUSH_INTERVAL_MS)) {
+LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(200));
+continue;
+}
 String payload = buildBatchJson(readSequence, batchSize);
 try {
 HttpRequest request = HttpRequest.newBuilder()
@@ -2138,19 +2402,14 @@ HttpRequest request = HttpRequest.newBuilder()
 HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
 if (response.statusCode() == 200) {
 readSequence += batchSize;
+lastFlushTime = System.currentTimeMillis();
 } else {
 handleError("Status " + response.statusCode());
+readSequence += batchSize;
 }
 } catch (Exception e) {
 handleError(e.getMessage());
-}
-long now = System.currentTimeMillis();
-if (now - lastFlushTime < FLUSH_INTERVAL_MS) {
-if (available <= MAX_BATCH_SIZE * 2) {
-LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(200));
-}
-} else {
-lastFlushTime = now;
+readSequence += batchSize;
 }
 }
 }
@@ -2161,8 +2420,8 @@ for (int i = 0; i < size; i++) {
 int idx = (int) ((startSeq + i) & indexMask);
 sb.append('{')
 .append("\"ts\":").append(tsBuffer[idx]).append(',')
-.append("\"inf\":").append(infBuffer[idx]).append(',')
-.append("\"tps\":").append(tpsBuffer[idx]).append(',')
+.append("\"inf\":").append(String.format("%.4f", infBuffer[idx])).append(',')
+.append("\"tps\":").append(String.format("%.2f", tpsBuffer[idx])).append(',')
 .append("\"mem\":").append(memBuffer[idx]).append(',')
 .append("\"threads\":").append(threadBuffer[idx])
 .append('}');
@@ -2185,16 +2444,8 @@ LockSupport.unpark(senderThread);
 senderThread.interrupt();
 }
 if (httpClientExecutor != null) {
-httpClientExecutor.shutdown();
-try {
-if (!httpClientExecutor.awaitTermination(1, TimeUnit.SECONDS)) {
 httpClientExecutor.shutdownNow();
 }
-} catch (InterruptedException e) {
-httpClientExecutor.shutdownNow();
-}
-}
-aggregator.reset();
 plugin.getLogger().info("[Web] Production Build Shutdown Gracefully");
 }
 public static class LockFreeAggregator {
@@ -2213,9 +2464,7 @@ throw new ExceptionInInitializerError(e);
 @SuppressWarnings("unused")
 private volatile long lastResetTime = System.currentTimeMillis();
 private final long windowSizeMs;
-private final EcoBridge plugin;
-public LockFreeAggregator(EcoBridge plugin) {
-this.plugin = plugin;
+public LockFreeAggregator() {
 this.windowSizeMs = TimeUnit.MINUTES.toMillis(5);
 }
 public void observe(double tps, long memory) {
@@ -2237,10 +2486,8 @@ private void resetStats() {
 minTps.reset();
 maxTps.reset();
 maxMemory.reset();
-plugin.getLogger().fine("[Web] Aggregator reset");
 }
 public void reset() {
-LAST_RESET.setRelease(this, System.currentTimeMillis());
 resetStats();
 }
 }
