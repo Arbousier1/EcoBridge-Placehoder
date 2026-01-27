@@ -34,29 +34,33 @@ public class EcoBridge extends JavaPlugin {
             // 0. 保存默认配置
             saveDefaultConfig();
 
-            // 1. 初始化核心子系统
+            // 1. 初始化核心子系统 (Database, PID, Market, Web, Integration)
             initializeComponents();
 
             // [配置] 确保 PID 配置已加载
-            pidController.reloadConfig();
+            if (pidController != null) pidController.reloadConfig();
 
             // 2. 异步初始化数据库 (内部会自动触发 loadAllStates 加载历史数据)
-            databaseManager.initPool();
+            if (databaseManager != null) databaseManager.initPool();
 
-            // 3. 注册 PlaceholderAPI
+            // 3. === [关键修复] 先启动性能监控，再启动调度器 ===
+            // 必须放在 startSchedulers() 之前，防止 NPE
+            if (getConfig().getBoolean("monitoring.enabled", true)) {
+                // 传入 this 和 pidController
+                performanceMonitor = new PerformanceMonitor(this, pidController);
+                getLogger().info("  ✓ Performance monitoring enabled");
+            } else {
+                getLogger().info("  - Performance monitoring disabled in config");
+            }
+
+            // 4. 注册 PlaceholderAPI
             registerPlaceholderAPI();
 
-            // 4. 注册命令
+            // 5. 注册命令
             registerCommands();
 
-            // 5. 启动定时调度器
+            // 6. 启动定时调度器 (此时 performanceMonitor 已不为 null)
             startSchedulers();
-
-            // 6. 启动性能监控 (传入 pidController 以监控 ContextPool 状态)
-            if (getConfig().getBoolean("monitoring.enabled", true)) {
-                performanceMonitor = new PerformanceMonitor(this, pidController);
-                getLogger().info("Performance monitoring enabled");
-            }
 
             // 7. 预热关键路径 (包含异步等待数据库和同步回调主线程)
             warmupCriticalPaths();
@@ -85,7 +89,7 @@ public class EcoBridge extends JavaPlugin {
         getLogger().info("  Gracefully shutting down EcoBridge...");
         getLogger().info("═══════════════════════════════════════════════");
 
-        fullyInitialized = false;
+        fullyInitialized = false; // 立即停止调度器中的逻辑执行
 
         try {
             // 1. 停止性能监控
@@ -202,8 +206,8 @@ public class EcoBridge extends JavaPlugin {
                 if (!fullyInitialized) return;
                 try {
                     integrationManager.collectDataAndCalculate();
-                    pidController.flushBuffer(false); // 异步 I/O，但提交操作轻量
-                    marketManager.updateActivityFactor();
+                    if (pidController != null) pidController.flushBuffer(false); // 异步 I/O，但提交操作轻量
+                    if (marketManager != null) marketManager.updateActivityFactor();
                 } catch (Exception e) {
                     getLogger().warning("[Scheduler] Main loop error: " + e.getMessage());
                 }
@@ -212,9 +216,6 @@ public class EcoBridge extends JavaPlugin {
         getLogger().info("  ✓ Main loop: every " + (mainInterval / 20) + "s");
 
         // [经济更新] 
-        // 注意：虽然 CoinsEngine API 是同步的，但如果在主线程做大量计算会卡顿。
-        // MarketManager 内部应使用 CompletableFuture 或 VirtualThread 处理耗时逻辑。
-        // 此处调度器保持异步触发。
         long economyInterval = getConfig().getLong("schedulers.economy-update.period", 36000L);
         long economyDelay = getConfig().getLong("schedulers.economy-update.initial-delay", 100L);
 
@@ -223,7 +224,7 @@ public class EcoBridge extends JavaPlugin {
             public void run() {
                 if (!fullyInitialized) return;
                 try {
-                    marketManager.updateEconomyMetrics();
+                    if (marketManager != null) marketManager.updateEconomyMetrics();
                 } catch (Exception e) {
                     getLogger().warning("[Scheduler] Economy update error: " + e.getMessage());
                 }
@@ -240,8 +241,10 @@ public class EcoBridge extends JavaPlugin {
             public void run() {
                 if (!fullyInitialized) return;
                 try {
-                    marketManager.updateMarketFlux();
-                    marketManager.updateHolidayCache();
+                    if (marketManager != null) {
+                        marketManager.updateMarketFlux();
+                        marketManager.updateHolidayCache();
+                    }
                 } catch (Exception e) {
                     getLogger().warning("[Scheduler] Market flux error: " + e.getMessage());
                 }
@@ -250,15 +253,22 @@ public class EcoBridge extends JavaPlugin {
         getLogger().info("  ✓ Market flux: every " + (marketInterval / 20 / 60) + "min");
 
         // [Web 报表] 纯 HTTP 推送，异步安全
-        long reportInterval = 1200L;
-        long reportDelay = 1200L;
+        long reportInterval = 1200L; // 60s
+        long reportDelay = 1200L;    // 延迟 60s 启动，防止刚开服数据不准
 
         new BukkitRunnable() {
             @Override
             public void run() {
-                if (!fullyInitialized) return;
+                // 这里加个双重保险，防止 task 刚启动时变量仍为 null
+                if (!fullyInitialized || performanceMonitor == null || webManager == null) return;
+                
                 try {
-                    webManager.pushMetrics(marketManager.getInflation(), performanceMonitor.getCurrentStats());
+                    // 获取数据
+                    var stats = performanceMonitor.getCurrentStats();
+                    double inflation = (marketManager != null) ? marketManager.getInflation() : 1.0;
+
+                    // 推送
+                    webManager.pushMetrics(inflation, stats);
                 } catch (Exception e) {
                     getLogger().warning("[Scheduler] Report push error: " + e.getMessage());
                 }
@@ -277,29 +287,32 @@ public class EcoBridge extends JavaPlugin {
             try {
                 // 1. 自旋等待数据库连接池初始化
                 int retries = 0;
-                while (!databaseManager.isInitialized() && retries++ < 50) {
+                while (databaseManager != null && !databaseManager.isInitialized() && retries++ < 50) {
                     Thread.sleep(100);
                 }
 
-                if (databaseManager.isInitialized()) {
+                if (databaseManager != null && databaseManager.isInitialized()) {
                     // 2. [重要修复] 同步商店数据必须回到主线程执行
-                    // UltimateShop 的 API (如 getDisplayName) 访问了 Bukkit API，严禁异步调用
                     Bukkit.getScheduler().runTask(this, () -> {
                         try {
-                            integrationManager.syncShops();
-                            getLogger().info("  ✓ Shop data synced (Main Thread)");
+                            if (integrationManager != null) {
+                                integrationManager.syncShops();
+                                getLogger().info("  ✓ Shop data synced (Main Thread)");
+                            }
                         } catch (Exception e) {
                             getLogger().warning("Shop sync error: " + e.getMessage());
                         }
                     });
 
                     // 3. 更新市场与节假日数据 (HTTP 请求，可在虚拟线程执行)
-                    marketManager.updateMarketFlux();
-                    marketManager.updateHolidayCache();
-                    getLogger().info("  ✓ Market data initialized");
+                    if (marketManager != null) {
+                        marketManager.updateMarketFlux();
+                        marketManager.updateHolidayCache();
+                        getLogger().info("  ✓ Market data initialized");
+                    }
 
                     // 4. 再次刷新配置，确保一致性
-                    pidController.reloadConfig();
+                    if (pidController != null) pidController.reloadConfig();
 
                     getLogger().info("  ✓ Warmup complete");
                 } else {
