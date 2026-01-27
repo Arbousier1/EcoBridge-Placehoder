@@ -30,8 +30,8 @@ public class PidController implements AutoCloseable {
 
     // 索引向量物种 - 使用 SPECIES_PREFERRED 确保长度匹配
     // 在 AVX-512 下: DoubleVector (512bit/8lanes) 对应 LongVector (512bit/8lanes)
-    private static final VectorSpecies<Long> L_SPECIES = LongVector.SPECIES_PREFERRED;
-    private static final VectorSpecies<Integer> I_SPECIES = IntVector.SPECIES_PREFERRED;
+    private static final VectorSpecies<Long> L_SPECIES = VectorSpecies.of(long.class, SPECIES.vectorShape());
+    private static final VectorSpecies<Integer> I_SPECIES = VectorSpecies.of(int.class, SPECIES.vectorShape());
     private static final int SEGMENT_BITS = 4;
     private static final int SEGMENT_COUNT = 1 << SEGMENT_BITS;
     private static final int SEGMENT_MASK = SEGMENT_COUNT - 1;
