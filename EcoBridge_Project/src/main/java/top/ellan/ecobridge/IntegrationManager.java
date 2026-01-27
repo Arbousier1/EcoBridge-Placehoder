@@ -9,159 +9,180 @@ import org.bukkit.Bukkit;
 
 import java.util.*;
 
+/**
+ * 集成管理器 - 极致性能最终版
+ * 特性：Direct Memory Access, Array-based Indexing, Snapshot Architecture
+ */
 public class IntegrationManager {
 
-    private record ItemEntry(
-            String rawId,       // 字符串 ID (用于指令补全)
-            int pidHandle,      // PID 快速句柄 (核心优化)
-            ObjectItem item     // UltimateShop 对象引用
+    // 极简 Entry，只存 Hot Path 必须的直接内存引用
+    private record FastItemEntry(
+            int pidHandle,                  // 数组索引句柄 (用于 lastTotalVolumes[handle])
+            ObjectUseTimesCache dataCache   // UltimateShop 数据对象直接引用 (跳过查找)
     ) {}
 
     private final EcoBridge plugin;
-    
-    // 活动条目列表 (Copy-On-Write 策略)
-    private volatile List<ItemEntry> activeEntries = Collections.emptyList();
-    
-    // 指令补全专用缓存
+
+    // ==================== 运行时热数据 (Hot Data) ====================
+    // 原生数组，CPU 缓存友好，无 List overhead
+    private volatile FastItemEntry[] fastEntries = new FastItemEntry[0];
+
+    // 记录上一 Tick 的总量：Index = Handle, Value = TotalVolume
+    // 扩容策略：在 syncShops 中按最大 Handle ID + Padding 分配
+    private double[] lastTotalVolumes = new double[0];
+
+    // ==================== 辅助数据 (Cold Data) ====================
+    // 仅用于指令补全
     private volatile List<String> monitoredIdCache = Collections.emptyList();
-    
-    // 记录上一次的累积销量：Handle -> LastTotalVolume
-    // 必须在主线程访问，或者加锁。由于 collectDataAndCalculate 在主线程运行，这里使用普通 Map 即可。
-    // 为了极致性能，推荐使用 fastutil 的 Int2DoubleOpenHashMap，这里用原生数组模拟或 Map
-    private final Map<Integer, Double> lastTotalVolumes = new HashMap<>(4096);
 
     public IntegrationManager(EcoBridge plugin) {
         this.plugin = plugin;
     }
 
     /**
-     * 数据采集核心逻辑
-     * 运行在主线程 (Sync) -> 提取增量 -> 投递给异步 PID
+     * [Phase 1: Data Capture]
+     * 运行在主线程 (Sync)，耗时必须控制在微秒级
+     * 返回不可变快照供 Phase 2 (Async) 使用
      */
-    public void collectDataAndCalculate() {
-        // 引用快照，保证线程安全
-        final List<ItemEntry> currentItems = this.activeEntries;
-        if (currentItems.isEmpty()) {
-            // 尝试惰性初始化
+    public EcoBridge.MarketSnapshot captureDataSnapshot() {
+        // 1. 获取本地引用，保证并发安全 (Copy-On-Write 读侧)
+        final FastItemEntry[] entries = this.fastEntries;
+        final int size = entries.length;
+
+        if (size == 0) {
+            // 惰性初始化尝试 (通常只在第一次或重载后发生)
             if (Bukkit.getPluginManager().isPluginEnabled("UltimateShop")) {
                 syncShops();
-                if (activeEntries.isEmpty()) return;
-            } else {
-                return;
+                // 如果初始化后还是空，或者这 tick 先跳过
+                if (fastEntries.length == 0) return null;
             }
+            return null;
         }
 
-        final int size = currentItems.size();
-        
-        // 使用原生数组，适配 OptimizedPidController 的 API
-        int[] handles = new int[size];
-        double[] deltaVolumes = new double[size];
+        // 2. 预分配快照数组 (Java 小数组分配极快，Eden 区分配)
+        int[] snapshotHandles = new int[size];
+        double[] snapshotDeltas = new double[size];
         int count = 0;
 
-        // --- 极速采集循环 ---
+        // 3. 极速循环 (Hot Loop)
         for (int i = 0; i < size; i++) {
-            ItemEntry entry = currentItems.get(i);
+            FastItemEntry entry = entries[i];
             
+            // 安全检查：防止 UltimateShop 重载导致对象失效
+            if (entry == null || entry.dataCache == null) continue;
+
             try {
-                // 1. 获取全服历史总销量 (Total Accumulation)
-                ObjectUseTimesCache cache = ShopHelper.getServerUseTimesCache(entry.item());
+                // [优化] 直接读取内存值，无方法调用开销
+                double currentTotal = entry.dataCache.getBuyUseTimes() + entry.dataCache.getSellUseTimes();
+                int handle = entry.pidHandle;
+
+                // [优化] 数组直接寻址 O(1)，无 Map 哈希开销
+                double lastTotal = lastTotalVolumes[handle];
                 
-                if (cache != null) {
-                    // 净历史总量 = 买入 - 卖出 (根据需求调整，通常我们监控买入量)
-                    // 如果要监控玩家卖给商店，那就是 SellUseTimes
-                    // 这里假设监控商店热度：买入 + 卖出，或者仅买入
-                    double currentTotal = cache.getBuyUseTimes() + cache.getSellUseTimes();
-                    
-                    // 2. 计算增量 (Delta) = 当前总量 - 上次记录的总量
-                    // PID 控制器需要的是"这一段时间内发生了多少交易"
-                    double lastTotal = lastTotalVolumes.getOrDefault(entry.pidHandle(), currentTotal);
-                    double delta = currentTotal - lastTotal;
-                    
-                    // 3. 更新历史记录
-                    lastTotalVolumes.put(entry.pidHandle(), currentTotal);
-                    
-                    // 4. 只有当数据有效时才录入 (或者即使是0也录入，取决于PID是否需要连续tick)
-                    // PID 需要连续的时间流，即使是 0 也要传
-                    handles[count] = entry.pidHandle();
-                    deltaVolumes[count] = delta;
-                    count++;
-                }
+                // 计算增量 (本 tick 交易量)
+                double delta = currentTotal - lastTotal;
+
+                // Write Back 更新历史状态
+                lastTotalVolumes[handle] = currentTotal;
+
+                // 录入快照
+                snapshotHandles[count] = handle;
+                snapshotDeltas[count] = delta;
+                count++;
+
             } catch (Exception ignored) {
-                // 容错处理
+                // 忽略极少数并发异常，保护主线程
             }
         }
 
-        if (count == 0) return;
+        if (count == 0) return null;
 
-        // 截断数组以匹配实际数量 (如果发生异常跳过了一些)
-        final int finalCount = count;
-        final int[] finalHandles = (count == size) ? handles : Arrays.copyOf(handles, count);
-        final double[] finalDeltas = (count == size) ? deltaVolumes : Arrays.copyOf(deltaVolumes, count);
+        // 4. 获取全局经济数据 (如果需要，例如 Vault 总余额，可以在此 hook)
+        // 这里仅示例
+        double totalBalance = 0.0; 
+        int onlinePlayers = Bukkit.getOnlinePlayers().size();
 
-        // 异步投递给 PID 控制器 (Non-Blocking)
-        // 这里的 calculateBatch 必须对应 OptimizedPidController 的方法
-        if (plugin.getPidController() != null) {
-            plugin.getPidController().calculateBatch(finalHandles, finalDeltas, finalCount);
-        }
+        // 5. 返回快照 (Record 是不可变的，且传递给 Virtual Thread 安全)
+        return new EcoBridge.MarketSnapshot(
+            totalBalance,
+            onlinePlayers,
+            System.currentTimeMillis(),
+            snapshotHandles, 
+            snapshotDeltas,
+            count // 实际有效数量
+        );
     }
 
     /**
-     * 同步商店与商品列表
-     * 构建 Handle 索引
+     * 同步商店数据
+     * 该方法较重，但只在启动或重载时运行
      */
     public synchronized void syncShops() {
-        // 检查 UltimateShop 是否就绪
-        if (!Bukkit.getPluginManager().isPluginEnabled("UltimateShop") || 
-            ConfigManager.configManager == null || 
-            ConfigManager.configManager.shopConfigs == null) {
-            return;
-        }
+        if (!Bukkit.getPluginManager().isPluginEnabled("UltimateShop")) return;
+        if (ConfigManager.configManager == null || ConfigManager.configManager.shopConfigs == null) return;
 
         Map<String, ObjectShop> shopMap = ConfigManager.configManager.shopConfigs;
         if (shopMap.isEmpty()) return;
 
-        List<ItemEntry> newEntries = new ArrayList<>(shopMap.size() * 10);
-        List<String> newIds = new ArrayList<>(shopMap.size() * 10);
+        List<FastItemEntry> tempEntries = new ArrayList<>(shopMap.size() * 5);
+        List<String> tempIds = new ArrayList<>();
         
-        // 获取 PID 控制器引用
         PidController pidCtrl = plugin.getPidController();
         if (pidCtrl == null) return;
 
+        int maxHandle = 0;
+
+        // 1. 遍历并构建索引
         for (Map.Entry<String, ObjectShop> entry : shopMap.entrySet()) {
             String shopId = entry.getKey();
             ObjectShop shop = entry.getValue();
-            if (shop == null) continue;
+            if (shop == null || shop.getProductList() == null) continue;
 
-            List<ObjectItem> productList = shop.getProductList();
-            if (productList == null) continue;
-
-            for (ObjectItem item : productList) {
-                String productId = item.getProduct(); 
+            for (ObjectItem item : shop.getProductList()) {
+                String productId = item.getProduct();
                 if (productId == null || productId.isEmpty()) continue;
 
-                // 构造唯一 ID
+                // 构造 ID 并获取 Handle (注册 PID)
                 String rawId = shopId + "_" + productId;
-                
-                // [关键修复] 在同步时直接获取/注册 PID Handle
-                // 这样在采集循环中就不需要查 Map 了
                 int handle = pidCtrl.getHandle(rawId);
                 
-                newEntries.add(new ItemEntry(rawId, handle, item));
-                newIds.add(rawId);
-                
-                // 初始化该物品的 lastTotal，防止刚启动时产生巨大的 Delta 脉冲
+                // 记录最大 Handle 以便分配数组
+                if (handle > maxHandle) maxHandle = handle;
+
+                // [核心优化] 预先获取 UltimateShop 的缓存对象引用 (Direct Pointer)
                 ObjectUseTimesCache cache = ShopHelper.getServerUseTimesCache(item);
+                
                 if (cache != null) {
-                    double currentTotal = cache.getBuyUseTimes() + cache.getSellUseTimes();
-                    lastTotalVolumes.put(handle, currentTotal);
+                    tempEntries.add(new FastItemEntry(handle, cache));
+                    tempIds.add(rawId);
                 }
             }
         }
 
-        this.activeEntries = newEntries;
-        this.monitoredIdCache = Collections.unmodifiableList(newIds);
+        // 2. 调整原生数组大小 (LastTotalVolumes)
+        if (lastTotalVolumes.length <= maxHandle) {
+            // 扩容策略：当前需求 + 256 缓冲
+            double[] newVolumes = new double[maxHandle + 256];
+            // 复制旧数据，防止状态丢失导致的瞬间 Delta 脉冲
+            System.arraycopy(lastTotalVolumes, 0, newVolumes, 0, Math.min(lastTotalVolumes.length, newVolumes.length));
+            this.lastTotalVolumes = newVolumes;
+        }
 
-        plugin.getLogger().info("[Integration] Synced " + activeEntries.size() + " items from UltimateShop.");
+        // 3. 初始化新加入物品的 LastTotal
+        // 防止：新物品加入时，Total 是 1000，Last 是 0 -> Delta 瞬间变 1000 -> 经济崩溃
+        for (FastItemEntry entry : tempEntries) {
+             double current = entry.dataCache.getBuyUseTimes() + entry.dataCache.getSellUseTimes();
+             // 只有当该 Handle 的历史数据为 0 (说明是新的或者之前没数据) 时才初始化
+             if (lastTotalVolumes[entry.pidHandle] == 0) {
+                 lastTotalVolumes[entry.pidHandle] = current;
+             }
+        }
+
+        // 4. 原子性替换引用 (Copy-On-Write 发布)
+        this.fastEntries = tempEntries.toArray(new FastItemEntry[0]);
+        this.monitoredIdCache = Collections.unmodifiableList(tempIds);
+
+        plugin.getLogger().info("[Integration] Optimized Sync: " + fastEntries.length + " items linked (Max Handle: " + maxHandle + ")");
     }
 
     public List<String> getMonitoredItems() {

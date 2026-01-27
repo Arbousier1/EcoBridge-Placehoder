@@ -1,0 +1,35 @@
+name: EcoBridge
+version: '${version}'
+main: top.ellan.ecobridge.EcoBridge
+api-version: '1.21'
+authors:
+  - Ellan
+website: https://github.com/Ellan/EcoBridge
+
+# Paper 专属依赖管理
+# load: BEFORE 表示这些前置插件需要在 EcoBridge 之前加载
+dependencies:
+  server:
+    PlaceholderAPI:
+      load: BEFORE
+      required: true
+    CoinsEngine:
+      load: BEFORE
+      required: true
+    UltimateShop:
+      load: BEFORE
+      required: true
+
+commands:
+  ecobridge:
+    description: "EcoBridge 经济调控系统核心指令"
+    usage: "/eb help"
+    permission: "ecobridge.admin"
+    aliases:
+      - eb
+      - eco
+
+permissions:
+  ecobridge.admin:
+    description: "允许使用重载、调试和数据查看功能"
+    default: op

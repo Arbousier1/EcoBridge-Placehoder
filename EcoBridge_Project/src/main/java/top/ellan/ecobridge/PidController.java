@@ -7,75 +7,46 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.StampedLock;
 
+/**
+ * 极致性能 PID 控制器 (最终修复版)
+ * 融合了 API 完整性与数学精度优化 (FMA)
+ */
 public class PidController implements AutoCloseable {
 
     // ==================== 1. 向量化与常量配置 ====================
     private static final VectorSpecies<Double> SPECIES = DoubleVector.SPECIES_PREFERRED;
     private static final int V_LEN = SPECIES.length();
 
-    // 分段配置 (16 Segments)
     private static final int SEGMENT_BITS = 4;
     private static final int SEGMENT_COUNT = 1 << SEGMENT_BITS;
     private static final int SEGMENT_MASK = SEGMENT_COUNT - 1;
 
-    // 容量配置 (每段 8192 个槽位，总容量 131,072)
     private static final int CAPACITY = 8192;
-    private static final int SLOT_MASK = 0xFFFF; // Handle 解析掩码
+    private static final int SLOT_MASK = 0xFFFF;
 
-    // FFM 内存布局
-    private static final ValueLayout.OfDouble D_LAYOUT = ValueLayout.JAVA_DOUBLE;
-    private static final ValueLayout.OfLong L_LAYOUT = ValueLayout.JAVA_LONG;
+    private static final ValueLayout.OfDouble D_LAYOUT = ValueLayout.JAVA_DOUBLE.withOrder(java.nio.ByteOrder.nativeOrder());
+    private static final ValueLayout.OfLong L_LAYOUT = ValueLayout.JAVA_LONG.withOrder(java.nio.ByteOrder.nativeOrder());
     private static final ValueLayout.OfByte B_LAYOUT = ValueLayout.JAVA_BYTE;
     private static final long D_SIZE = 8L;
 
-    // ==================== 2. 可配置 PID 参数（实例字段） ====================
-    private double target;
-    private double deadband;
-    private double kp;
-    private double kpNegativeMultiplier;
-    private double ki;
-    private double kd;
-    private double base;
-    private double alpha;
-    private double beta;
-    private double tau;
-    private double integralMax;
-    private double integralMin;
-    private double lambdaMax;
-    private double lambdaMin;
-    private double dtMax;
-    private double dtMin;
+    // ==================== 2. PID 参数 ====================
+    private double target, deadband, kp, kpNegMultiplier, ki, kd, base, alpha, beta, tau;
+    private double integralMax, integralMin, lambdaMax, lambdaMin, dtMax, dtMin;
 
-    // 向量化常量（运行时生成）
-    private DoubleVector vTarget;
-    private DoubleVector vDeadband;
-    private DoubleVector vKp;
-    private DoubleVector vKpNeg;
-    private DoubleVector vKi;
-    private DoubleVector vKd;
-    private DoubleVector vBase;
-    private DoubleVector vAlpha;
-    private DoubleVector vBeta;
-    private DoubleVector vZero;
-    private DoubleVector vOne;
-    private DoubleVector vIMax;
-    private DoubleVector vIMin;
-    private DoubleVector vLMax;
-    private DoubleVector vLMin;
-    private DoubleVector vDtMax;
-    private DoubleVector vDtMin;
-    private DoubleVector vNegTauInv;
+    private DoubleVector vTarget, vDeadband, vKp, vKpNeg, vKi, vKd, vBase, vAlpha, vBeta;
+    private DoubleVector vZero, vOne, vIMax, vIMin, vLMax, vLMin, vDtMax, vDtMin, vNegTauInv;
 
     // ==================== 3. 核心成员 ====================
     private final EcoBridge plugin;
     private final Arena arena;
     private final Segment[] segments;
-
     private final ConcurrentHashMap<String, Integer> registry = new ConcurrentHashMap<>(4096);
     private final ConcurrentHashMap<Integer, String> handleToId = new ConcurrentHashMap<>(4096);
-
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final ThreadLocal<CalcContext> tlContext = ThreadLocal.withInitial(CalcContext::new);
+
+    // ==================== DTO 定义 ====================
+    public record PidStateDto(double integral, double lastError, double lastLambda, long updateTime) {}
 
     public PidController(EcoBridge plugin) {
         this.plugin = plugin;
@@ -85,7 +56,8 @@ public class PidController implements AutoCloseable {
             this.segments[i] = new Segment(arena);
         }
         loadConfig();
-        plugin.getLogger().info("[PID] Ultimate Optimized Controller Initialized. Vector Lane: " + V_LEN + ", Target: " + target);
+        // [修复] 添加初始化日志，方便排查 SIMD 是否生效
+        plugin.getLogger().info("[PID] Controller Initialized. Vector Lane: " + V_LEN + ", Target: " + target);
     }
 
     private void loadConfig() {
@@ -93,7 +65,7 @@ public class PidController implements AutoCloseable {
         this.target = cfg.getDouble("pid.target", 1000.0);
         this.deadband = cfg.getDouble("pid.deadband", 20.0);
         this.kp = cfg.getDouble("pid.kp", 0.00001);
-        this.kpNegativeMultiplier = cfg.getDouble("pid.kp-negative-multiplier", 0.6);
+        this.kpNegMultiplier = cfg.getDouble("pid.kp-negative-multiplier", 0.6);
         this.ki = cfg.getDouble("pid.ki", 0.000001);
         this.kd = cfg.getDouble("pid.kd", 0.00005);
         this.base = cfg.getDouble("pid.base", 0.002);
@@ -107,11 +79,10 @@ public class PidController implements AutoCloseable {
         this.dtMax = cfg.getDouble("pid.dt-max", 1.0);
         this.dtMin = cfg.getDouble("pid.dt-min", 0.05);
 
-        // 生成向量常量
         this.vTarget = DoubleVector.broadcast(SPECIES, target);
         this.vDeadband = DoubleVector.broadcast(SPECIES, deadband);
         this.vKp = DoubleVector.broadcast(SPECIES, kp);
-        this.vKpNeg = DoubleVector.broadcast(SPECIES, kp * kpNegativeMultiplier);
+        this.vKpNeg = DoubleVector.broadcast(SPECIES, kp * kpNegMultiplier);
         this.vKi = DoubleVector.broadcast(SPECIES, ki);
         this.vKd = DoubleVector.broadcast(SPECIES, kd);
         this.vBase = DoubleVector.broadcast(SPECIES, base);
@@ -130,21 +101,35 @@ public class PidController implements AutoCloseable {
 
     public void reloadConfig() {
         loadConfig();
-        plugin.getLogger().info("[PID] PID parameters reloaded from config");
+        plugin.getLogger().info("[PID] Parameters reloaded.");
     }
 
-    // ==================== 4. 注册 API (Cold Path) ====================
+    // ==================== 4. 业务 API ====================
+
+    /**
+     * 主计算入口
+     */
+    public EcoBridge.CalculationResult calculate(EcoBridge.MarketSnapshot snapshot) {
+        if (closed.get() || snapshot.validItemCount() == 0) {
+            return new EcoBridge.CalculationResult(0.0, base);
+        }
+        // 调用内部批量计算逻辑并返回 Lambda 总和
+        double totalLambda = calculateBatchInternal(snapshot.itemHandles(), snapshot.itemDeltas(), snapshot.validItemCount());
+        double avgLambda = totalLambda / snapshot.validItemCount();
+        return new EcoBridge.CalculationResult(avgLambda, avgLambda * 10.0);
+    }
+
     public int getHandle(String itemId) {
         return registry.computeIfAbsent(itemId, id -> {
             int hash = Math.abs(id.hashCode());
             int segId = hash & SEGMENT_MASK;
             Segment seg = segments[segId];
-
             long stamp = seg.lock.writeLock();
             try {
                 int slot = seg.allocateSlot();
                 if (slot < 0) {
-                    plugin.getLogger().warning("[PID] Segment " + segId + " overflow!");
+                    // [修复] 增加溢出警告
+                    plugin.getLogger().warning("[PID] Segment " + segId + " overflow when allocating: " + itemId);
                     return -1;
                 }
                 int handle = (segId << 16) | slot;
@@ -163,52 +148,91 @@ public class PidController implements AutoCloseable {
         int slot = handle & SLOT_MASK;
         Segment seg = segments[segId];
         long offset = (long) slot * D_SIZE;
-
         long stamp = seg.lock.tryOptimisticRead();
-        double lambda = seg.lambdas.get(D_LAYOUT, offset);
+        double val = seg.lambdas.get(D_LAYOUT, offset);
         if (!seg.lock.validate(stamp)) {
             stamp = seg.lock.readLock();
+            try { val = seg.lambdas.get(D_LAYOUT, offset); } finally { seg.lock.unlockRead(stamp); }
+        }
+        return val;
+    }
+
+    // ==================== 5. 管理端 API ====================
+
+    public int getCacheSize() {
+        return registry.size();
+    }
+
+    public int getDirtyQueueSize() {
+        int count = 0;
+        for (Segment seg : segments) {
+            long stamp = seg.lock.readLock();
             try {
-                lambda = seg.lambdas.get(D_LAYOUT, offset);
+                for (int i = seg.allocationMap.nextSetBit(0); i >= 0; i = seg.allocationMap.nextSetBit(i + 1)) {
+                    if (seg.dirty.get(B_LAYOUT, (long) i) == (byte) 1) {
+                        count++;
+                    }
+                }
             } finally {
                 seg.lock.unlockRead(stamp);
             }
         }
-        return lambda;
+        return count;
     }
 
-    // ==================== 5. 批量计算 API (Hot Path) ====================
-    public void calculateBatch(int[] handles, double[] volumes, int count) {
-        if (closed.get() || count == 0) return;
+    public PidStateDto inspectState(String itemId) {
+        Integer handle = registry.get(itemId);
+        if (handle == null) return null;
 
+        int segId = handle >>> 16;
+        int slot = handle & SLOT_MASK;
+        Segment seg = segments[segId];
+        long offset = (long) slot * D_SIZE;
+
+        long stamp = seg.lock.readLock();
+        try {
+            return new PidStateDto(
+                seg.integrals.get(D_LAYOUT, offset),
+                seg.errors.get(D_LAYOUT, offset),
+                seg.lambdas.get(D_LAYOUT, offset),
+                seg.times.get(L_LAYOUT, offset)
+            );
+        } finally {
+            seg.lock.unlockRead(stamp);
+        }
+    }
+
+    /**
+     * 基准测试专用
+     */
+    public void calculateBatch(int[] handles, double[] volumes, int count) {
+        calculateBatchInternal(handles, volumes, count);
+    }
+
+    // ==================== 6. 核心计算逻辑 ====================
+
+    private double calculateBatchInternal(int[] handles, double[] volumes, int count) {
         CalcContext ctx = tlContext.get();
         ctx.reset();
-
         for (int i = 0; i < count; i++) {
             int h = handles[i];
             if (h == -1) continue;
-            int segId = h >>> 16;
-            int slot = h & SLOT_MASK;
-            ctx.push(segId, slot, volumes[i]);
+            ctx.push(h >>> 16, h & SLOT_MASK, volumes[i]);
         }
-
         long now = System.currentTimeMillis();
+        double sum = 0.0;
         for (int i = 0; i < SEGMENT_COUNT; i++) {
-            if (ctx.counts[i] > 0) {
-                processSegment(segments[i], ctx, i, now);
-            }
+            if (ctx.counts[i] > 0) sum += processSegment(segments[i], ctx, i, now);
         }
-
-        if (plugin.getPerformanceMonitor() != null) {
-            plugin.getPerformanceMonitor().recordCalculation(true);
-        }
+        if (plugin.getPerformanceMonitor() != null) plugin.getPerformanceMonitor().recordCalculation(true);
+        return sum;
     }
 
-    // ==================== 6. 核心计算逻辑 (SIMD + FMA + ILP) ====================
-    private void processSegment(Segment seg, CalcContext ctx, int segId, long now) {
+    private double processSegment(Segment seg, CalcContext ctx, int segId, long now) {
         int count = ctx.counts[segId];
         int[] slots = ctx.segSlots[segId];
         double[] vols = ctx.segVols[segId];
+        double segLambdaSum = 0.0;
 
         long stamp = seg.lock.writeLock();
         try {
@@ -217,22 +241,20 @@ public class PidController implements AutoCloseable {
             MemorySegment msLam = seg.lambdas;
             MemorySegment msTime = seg.times;
             MemorySegment msDirty = seg.dirty;
+            double[] vBuf = ctx.vBufState;
 
             int i = 0;
             int loopBound = SPECIES.loopBound(count);
-            double[] vBuf = ctx.vBufState;
 
-            // SIMD 主循环
+            // ---------------- SIMD Loop ----------------
             for (; i < loopBound; i += V_LEN) {
-                // Gather
                 for (int lane = 0; lane < V_LEN; lane++) {
                     int slotIdx = slots[i + lane];
                     long offset = (long) slotIdx * D_SIZE;
                     vBuf[lane] = msInt.get(D_LAYOUT, offset);
                     vBuf[lane + V_LEN] = msErr.get(D_LAYOUT, offset);
                     vBuf[lane + 2 * V_LEN] = msLam.get(D_LAYOUT, offset);
-                    long lastT = msTime.get(L_LAYOUT, offset);
-                    vBuf[lane + 3 * V_LEN] = (now - lastT) * 0.001;
+                    vBuf[lane + 3 * V_LEN] = (now - msTime.get(L_LAYOUT, offset)) * 0.001;
                 }
 
                 DoubleVector vIntegral = DoubleVector.fromArray(SPECIES, vBuf, 0);
@@ -241,43 +263,23 @@ public class PidController implements AutoCloseable {
                 DoubleVector vDt = DoubleVector.fromArray(SPECIES, vBuf, 3 * V_LEN);
                 DoubleVector vVol = DoubleVector.fromArray(SPECIES, vols, i);
 
-                // Clamp DT
                 vDt = vDt.max(vDtMin).min(vDtMax);
-
-                // Error + Deadband
                 DoubleVector vErrRaw = vVol.sub(vTarget);
-                VectorMask<Double> maskDead = vErrRaw.abs().compare(VectorOperators.LT, vDeadband);
-                DoubleVector vErr = vErrRaw.blend(vZero, maskDead);
-
-                // D Term
+                DoubleVector vErr = vErrRaw.blend(vZero, vErrRaw.abs().compare(VectorOperators.LT, vDeadband));
                 DoubleVector vDPart = vErr.sub(vLastErr).div(vDt);
 
-                // Integral Decay (FMA)
+                // SIMD FMA 优化
                 DoubleVector vDecay = vDt.fma(vNegTauInv, vOne);
-                vIntegral = vIntegral.mul(vDecay);
-                vIntegral = vErr.fma(vDt, vIntegral);
-                vIntegral = vIntegral.max(vIMin).min(vIMax);
+                vIntegral = vIntegral.mul(vDecay).add(vErr.mul(vDt)).max(vIMin).min(vIMax);
 
-                // P Term (Branchless)
-                VectorMask<Double> maskNeg = vErr.compare(VectorOperators.LT, vZero);
-                DoubleVector vKpUsed = vKp.blend(vKpNeg, maskNeg);
-                DoubleVector vP = vErr.mul(vKpUsed);
+                DoubleVector vKpUsed = vKp.blend(vKpNeg, vErr.compare(VectorOperators.LT, vZero));
+                DoubleVector vRaw = vErr.mul(vKpUsed).add(vIntegral.mul(vKi)).add(vDPart.mul(vKd)).add(vBase);
+                vLambda = vLambda.fma(vBeta, vRaw.mul(vAlpha)).max(vLMin).min(vLMax);
 
-                // D & I Term
-                DoubleVector vD = vDPart.mul(vKd);
-                DoubleVector vI = vIntegral.mul(vKi);
-
-                // Raw Lambda
-                DoubleVector vRaw = vP.add(vI).add(vD).add(vBase);
-
-                // Lambda EMA (FMA)
-                vLambda = vLambda.fma(vBeta, vRaw.mul(vAlpha));
-                vLambda = vLambda.max(vLMin).min(vLMax);
-
-                // Scatter
                 vIntegral.intoArray(vBuf, 0);
                 vErr.intoArray(vBuf, V_LEN);
                 vLambda.intoArray(vBuf, 2 * V_LEN);
+                segLambdaSum += vLambda.reduceLanes(VectorOperators.ADD);
 
                 for (int lane = 0; lane < V_LEN; lane++) {
                     int slotIdx = slots[i + lane];
@@ -290,33 +292,33 @@ public class PidController implements AutoCloseable {
                 }
             }
 
-            // Scalar Tail
+            // ---------------- Scalar Tail ----------------
             for (; i < count; i++) {
                 int slotIdx = slots[i];
                 long offset = (long) slotIdx * D_SIZE;
-
-                double dt = (now - msTime.get(L_LAYOUT, offset)) * 0.001;
-                dt = Math.max(dtMin, Math.min(dtMax, dt));
-
+                double dt = Math.max(dtMin, Math.min(dtMax, (now - msTime.get(L_LAYOUT, offset)) * 0.001));
+                
                 double integral = msInt.get(D_LAYOUT, offset);
-                integral *= (1.0 - dt * tau);
-
-                double vol = vols[i];
-                double err = vol - target;
+                double lastErr = msErr.get(D_LAYOUT, offset);
+                double lambda = msLam.get(D_LAYOUT, offset);
+                
+                double err = vols[i] - target;
                 if (Math.abs(err) < deadband) err = 0.0;
 
-                double kpUsed = (err < 0) ? kp * kpNegativeMultiplier : kp;
+                // [修复] 补回 Math.fma 优化
+                integral = integral * (1.0 - dt * tau);
                 integral = Math.fma(err, dt, integral);
                 integral = Math.max(integralMin, Math.min(integralMax, integral));
-
-                double lastErr = msErr.get(D_LAYOUT, offset);
-                double d = (err - lastErr) / dt * kd;
-
-                double raw = kpUsed * err + integral * ki + d + base;
-                double lambda = msLam.get(D_LAYOUT, offset);
+                
+                double kpUsed = (err < 0) ? kp * kpNegMultiplier : kp;
+                double raw = kpUsed * err + integral * ki + (err - lastErr) / dt * kd + base;
+                
+                // Lambda EMA
                 lambda = Math.fma(lambda, beta, raw * alpha);
                 lambda = Math.max(lambdaMin, Math.min(lambdaMax, lambda));
 
+                segLambdaSum += lambda;
+                
                 msInt.set(D_LAYOUT, offset, integral);
                 msErr.set(D_LAYOUT, offset, err);
                 msLam.set(D_LAYOUT, offset, lambda);
@@ -326,21 +328,17 @@ public class PidController implements AutoCloseable {
         } finally {
             seg.lock.unlockWrite(stamp);
         }
+        return segLambdaSum;
     }
 
-    // ==================== 7. 内部数据结构 ====================
-    private static class Segment {
-        @SuppressWarnings("unused")
-        long p01, p02, p03, p04, p05, p06, p07;
-        final StampedLock lock = new StampedLock();
-        @SuppressWarnings("unused")
-        long p11, p12, p13, p14, p15, p16, p17;
+    // ==================== 7. 内部类与清理 ====================
 
-        final MemorySegment integrals;
-        final MemorySegment errors;
-        final MemorySegment lambdas;
-        final MemorySegment times;
-        final MemorySegment dirty;
+    private static class Segment {
+        @SuppressWarnings("unused") long p01, p02, p03, p04, p05, p06, p07;
+        final StampedLock lock = new StampedLock();
+        @SuppressWarnings("unused") long p11, p12, p13, p14, p15, p16, p17;
+
+        final MemorySegment integrals, errors, lambdas, times, dirty;
         final BitSet allocationMap = new BitSet(CAPACITY);
 
         Segment(Arena arena) {
@@ -351,61 +349,45 @@ public class PidController implements AutoCloseable {
             dirty = arena.allocate(B_LAYOUT, CAPACITY);
             warmup();
         }
+        
+        void warmup() {
+            for(int i=0;i<CAPACITY;i+=512) integrals.setAtIndex(D_LAYOUT, i, 0); 
+        }
 
         int allocateSlot() {
             int slot = allocationMap.nextClearBit(0);
             if (slot >= CAPACITY) return -1;
             allocationMap.set(slot);
-            lambdas.setAtIndex(D_LAYOUT, slot, 0.002); // 默认 lambda
+            lambdas.setAtIndex(D_LAYOUT, slot, 0.002);
             times.setAtIndex(L_LAYOUT, slot, System.currentTimeMillis());
             return slot;
-        }
-
-        void warmup() {
-            for (int i = 0; i < CAPACITY; i += 512) {
-                integrals.setAtIndex(D_LAYOUT, i, 0);
-            }
         }
     }
 
     private static class CalcContext {
-        static final int INITIAL_CAPACITY = 512;
         static final int MAX_CAPACITY = 1024 * 1024;
-
-        int[][] segSlots = new int[SEGMENT_COUNT][INITIAL_CAPACITY];
-        double[][] segVols = new double[SEGMENT_COUNT][INITIAL_CAPACITY];
+        int[][] segSlots = new int[SEGMENT_COUNT][1024];
+        double[][] segVols = new double[SEGMENT_COUNT][1024];
         final int[] counts = new int[SEGMENT_COUNT];
         final double[] vBufState = new double[4 * V_LEN];
 
-        void reset() {
-            Arrays.fill(counts, 0);
-        }
-
+        void reset() { Arrays.fill(counts, 0); }
         void push(int segId, int slot, double vol) {
             int idx = counts[segId]++;
-            if (idx >= segSlots[segId].length) {
-                grow(segId);
-            }
+            if (idx >= segSlots[segId].length) grow(segId);
             segSlots[segId][idx] = slot;
             segVols[segId][idx] = vol;
         }
-
-        private void grow(int segId) {
-            int oldCap = segSlots[segId].length;
-            if (oldCap >= MAX_CAPACITY) throw new OutOfMemoryError("PID Context buffer limit");
-            int newCap = oldCap + (oldCap >> 1);
-            if (newCap > MAX_CAPACITY) newCap = MAX_CAPACITY;
-
-            int[] newSlots = new int[newCap];
-            double[] newVols = new double[newCap];
-            System.arraycopy(segSlots[segId], 0, newSlots, 0, oldCap);
-            System.arraycopy(segVols[segId], 0, newVols, 0, oldCap);
-            segSlots[segId] = newSlots;
-            segVols[segId] = newVols;
+        void grow(int segId) {
+            int old = segSlots[segId].length;
+            if (old >= MAX_CAPACITY) return;
+            // [优化] 使用更激进的扩容策略减少 resize 次数
+            int cap = Math.min(old << 1, MAX_CAPACITY);
+            segSlots[segId] = Arrays.copyOf(segSlots[segId], cap);
+            segVols[segId] = Arrays.copyOf(segVols[segId], cap);
         }
     }
 
-    // ==================== 8. 生命周期与诊断 ====================
     @Override
     public void close() {
         if (closed.compareAndSet(false, true)) {
@@ -413,31 +395,9 @@ public class PidController implements AutoCloseable {
         }
     }
 
-    public int getCacheSize() {
-        return registry.size();
-    }
-
-    public int getDirtyQueueSize() {
-        int totalDirty = 0;
-        for (Segment seg : segments) {
-            long stamp = seg.lock.readLock();
-            try {
-                for (int i = seg.allocationMap.nextSetBit(0); i >= 0; i = seg.allocationMap.nextSetBit(i + 1)) {
-                    if (seg.dirty.get(B_LAYOUT, (long) i) == (byte) 1) {
-                        totalDirty++;
-                    }
-                }
-            } finally {
-                seg.lock.unlockRead(stamp);
-            }
-        }
-        return totalDirty;
-    }
-
     public void flushBuffer(boolean sync) {
         if (closed.get()) return;
-        List<DatabaseManager.PidDbSnapshot> batch = new ArrayList<>();
-
+        List<DatabaseManager.PidDbSnapshot> batch = new ArrayList<>(1024);
         for (int segId = 0; segId < SEGMENT_COUNT; segId++) {
             Segment seg = segments[segId];
             long stamp = seg.lock.writeLock();
@@ -445,62 +405,34 @@ public class PidController implements AutoCloseable {
                 for (int i = seg.allocationMap.nextSetBit(0); i >= 0; i = seg.allocationMap.nextSetBit(i + 1)) {
                     if (seg.dirty.get(B_LAYOUT, (long) i) == (byte) 1) {
                         seg.dirty.set(B_LAYOUT, (long) i, (byte) 0);
-                        int targetHandle = (segId << 16) | i;
-                        String itemId = handleToId.get(targetHandle);
-                        if (itemId != null) {
+                        int handle = (segId << 16) | i;
+                        String id = handleToId.get(handle);
+                        if (id != null) {
                             long offset = (long) i * D_SIZE;
-                            batch.add(new DatabaseManager.PidDbSnapshot(
-                                    itemId,
-                                    seg.integrals.get(D_LAYOUT, offset),
-                                    seg.errors.get(D_LAYOUT, offset),
-                                    seg.lambdas.get(D_LAYOUT, offset),
-                                    seg.times.get(L_LAYOUT, offset)
-                            ));
+                            batch.add(new DatabaseManager.PidDbSnapshot(id,
+                                seg.integrals.get(D_LAYOUT, offset),
+                                seg.errors.get(D_LAYOUT, offset),
+                                seg.lambdas.get(D_LAYOUT, offset),
+                                seg.times.get(L_LAYOUT, offset)));
                         }
                     }
-                    if (batch.size() >= 1000) break;
+                    if (batch.size() >= 1000) { save(batch, sync); batch.clear(); }
                 }
-            } finally {
-                seg.lock.unlockWrite(stamp);
-            }
-            if (batch.size() >= 1000) break;
+            } finally { seg.lock.unlockWrite(stamp); }
         }
-
-        if (batch.isEmpty()) return;
-
-        if (sync) {
-            plugin.getDatabaseManager().saveBatch(batch);
-        } else {
-            Thread.ofVirtual().start(() -> plugin.getDatabaseManager().saveBatch(batch));
-        }
+        if (!batch.isEmpty()) save(batch, sync);
     }
 
-    public PidStateDto inspectState(String itemId) {
-        Integer handle = registry.get(itemId);
-        if (handle == null) return null;
-        int segId = handle >>> 16;
-        int slot = handle & SLOT_MASK;
-        Segment seg = segments[segId];
-        long offset = (long) slot * D_SIZE;
-        long stamp = seg.lock.readLock();
-        try {
-            return new PidStateDto(
-                    seg.integrals.get(D_LAYOUT, offset),
-                    seg.errors.get(D_LAYOUT, offset),
-                    seg.lambdas.get(D_LAYOUT, offset),
-                    seg.times.get(L_LAYOUT, offset)
-            );
-        } finally {
-            seg.lock.unlockRead(stamp);
-        }
+    private void save(List<DatabaseManager.PidDbSnapshot> batch, boolean sync) {
+        List<DatabaseManager.PidDbSnapshot> copy = new ArrayList<>(batch);
+        if (sync) plugin.getDatabaseManager().saveBatch(copy);
+        else Thread.ofVirtual().start(() -> plugin.getDatabaseManager().saveBatch(copy));
     }
-
-    public record PidStateDto(double integral, double lastError, double lastLambda, long updateTime) {}
 
     public void loadAllStates() {
         if (closed.get()) return;
-        plugin.getDatabaseManager().loadStates(snapshot -> {
-            int handle = getHandle(snapshot.itemId());
+        plugin.getDatabaseManager().loadStates(s -> {
+            int handle = getHandle(s.itemId());
             if (handle < 0) return;
             int segId = handle >>> 16;
             int slot = handle & SLOT_MASK;
@@ -508,14 +440,12 @@ public class PidController implements AutoCloseable {
             long offset = (long) slot * D_SIZE;
             long stamp = seg.lock.writeLock();
             try {
-                seg.integrals.set(D_LAYOUT, offset, snapshot.integral());
-                seg.errors.set(D_LAYOUT, offset, snapshot.lastError());
-                seg.lambdas.set(D_LAYOUT, offset, snapshot.lastLambda());
-                seg.times.set(L_LAYOUT, offset, snapshot.updateTime());
+                seg.integrals.set(D_LAYOUT, offset, s.integral());
+                seg.errors.set(D_LAYOUT, offset, s.lastError());
+                seg.lambdas.set(D_LAYOUT, offset, s.lastLambda());
+                seg.times.set(L_LAYOUT, offset, s.updateTime());
                 seg.dirty.set(B_LAYOUT, (long) slot, (byte) 0);
-            } finally {
-                seg.lock.unlockWrite(stamp);
-            }
+            } finally { seg.lock.unlockWrite(stamp); }
         });
     }
 }
