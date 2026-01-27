@@ -9,6 +9,7 @@ import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -59,7 +60,7 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
                 plugin.getPluginMeta().getVersion());
         msg(sender, "");
         msg(sender, " <yellow>基础维护:");
-        msg(sender, "  <gold>/eb reload <dark_gray>• <gray>热重载配置、商店、市场、PID 参数 ");
+        msg(sender, "  <gold>/eb reload <dark_gray>• <gray>热重载配置、商店、市场、PID 及 Web 参数 ");
         msg(sender, "  <gold>/eb check [玩家] <dark_gray>• <gray>分析指定玩家的经济因子");
         msg(sender, "  <gold>/eb inspect <ID> <dark_gray>• <gray>实时审查物品 PID 运行数据");
         msg(sender, "  <gold>/eb save <dark_gray>• <gray>强制刷写脏数据至数据库");
@@ -79,20 +80,29 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
             try {
                 plugin.reloadConfig();
 
+                // [Fix] 重载 WebManager 配置 (支持热更新 node-api-url)
+                if (plugin.getWebManager() != null) {
+                    plugin.getWebManager().reloadConfig();
+                }
+
                 // 1. 重载 PID 参数 (纯配置读取，异步安全)
-                plugin.getPidController().reloadConfig();
+                if (plugin.getPidController() != null) {
+                    plugin.getPidController().reloadConfig();
+                }
 
                 // 2. [修复] 同步商店数据必须回主线程 (涉及 Bukkit API)
-                // 使用 CountDownLatch 或 Future 等待主线程完成，或者直接 fire-and-forget
-                // 这里为了简单，我们让它排队执行，不阻塞当前异步线程的计时
                 Bukkit.getScheduler().runTask(plugin, () -> {
-                    plugin.getIntegrationManager().syncShops();
+                    if (plugin.getIntegrationManager() != null) {
+                        plugin.getIntegrationManager().syncShops();
+                    }
                 });
 
                 // 3. 重载其他模块 (HTTP 请求/纯计算，异步安全)
-                plugin.getMarketManager().updateHolidayCache();
-                plugin.getMarketManager().updateEconomyMetrics(); // 如果这里有非线程安全操作也需注意
-                plugin.getMarketManager().updateMarketFlux();
+                if (plugin.getMarketManager() != null) {
+                    plugin.getMarketManager().updateHolidayCache();
+                    plugin.getMarketManager().updateEconomyMetrics();
+                    plugin.getMarketManager().updateMarketFlux();
+                }
 
                 msg(sender, "<green>✓ 重载成功! 耗时: <white>" + (System.currentTimeMillis() - start) + "ms");
             } catch (Exception e) {
@@ -110,8 +120,10 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
 
         msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         msg(sender, "<gradient:gold:yellow>性能实时监控</gradient>");
-        msg(sender, " <gray>控制器缓存: <aqua>" + plugin.getPidController().getCacheSize() + " <dark_gray>items");
-        msg(sender, " <gray>待刷写数据: <red>" + plugin.getPidController().getDirtyQueueSize() + " <dark_gray>pending");
+        if (plugin.getPidController() != null) {
+            msg(sender, " <gray>控制器缓存: <aqua>" + plugin.getPidController().getCacheSize() + " <dark_gray>items");
+            msg(sender, " <gray>待刷写数据: <red>" + plugin.getPidController().getDirtyQueueSize() + " <dark_gray>pending");
+        }
         msg(sender, " <gray>TPS (1m): " + (tps > 18 ? "<green>" : "<red>") + String.format("%.2f", tps));
         msg(sender, String.format(" <gray>JVM 内存: <aqua>%.0fMB <dark_gray>/ <gray>%.0fMB", usedMem, maxMem));
         msg(sender, " <gray>活跃线程: <white>" + Thread.activeCount());
@@ -138,14 +150,15 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
         msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         msg(sender, "<gradient:green:lime>系统健康普查</gradient>");
 
-        boolean db = plugin.getDatabaseManager().getDataSource() != null &&
+        boolean db = plugin.getDatabaseManager() != null &&
+                     plugin.getDatabaseManager().getDataSource() != null &&
                      !plugin.getDatabaseManager().getDataSource().isClosed();
         msg(sender, " <gray>数据库连接: " + (db ? "<green>健康" : "<red>离线"));
 
-        int shops = plugin.getIntegrationManager().getMonitoredItems().size();
+        int shops = (plugin.getIntegrationManager() != null) ? plugin.getIntegrationManager().getMonitoredItems().size() : 0;
         msg(sender, " <gray>商店映射: <white>" + (shops > 0 ? "<green>已挂载 (" + shops + ")" : "<red>无数据"));
 
-        int pidItems = plugin.getPidController().getCacheSize();
+        int pidItems = (plugin.getPidController() != null) ? plugin.getPidController().getCacheSize() : 0;
         msg(sender, " <gray>计算内核: " + (pidItems > 0 ? "<green>活动中" : "<yellow>空闲"));
 
         msg(sender, "<dark_gray><st>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -154,6 +167,10 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
     private void handleInspect(CommandSender sender, String[] args) {
         if (args.length < 2) {
             msg(sender, "<red>用法: /eb inspect <shopId_productId>");
+            return;
+        }
+        if (plugin.getPidController() == null) {
+            msg(sender, "<red>✗ PID 控制器未初始化。");
             return;
         }
         String itemId = args[1];
@@ -178,6 +195,10 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
             return;
         }
         MarketManager mm = plugin.getMarketManager();
+        if (mm == null) {
+            msg(sender, "<red>✗ 市场管理器未初始化。");
+            return;
+        }
         double p = mm.calculatePersonalFactor(target);
         double f = mm.getMarketFlux();
         double h = mm.getHolidayFactor();
@@ -204,6 +225,8 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             try {
                 PidController pid = plugin.getPidController();
+                if (pid == null) return;
+                
                 Random rand = new Random();
                 int totalIterations = 5_000_000;
                 int batchSize = 4096;
@@ -213,6 +236,7 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
                 double[] volumes = new double[batchSize];
 
                 // 填充随机有效 handle（使用缓存中的物品）
+                if (plugin.getIntegrationManager() == null) return;
                 List<String> monitored = plugin.getIntegrationManager().getMonitoredItems();
                 if (monitored.isEmpty()) {
                     msg(sender, "<red>✗ 没有可用于基准测试的物品数据。");
@@ -250,6 +274,10 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
     }
 
     private void handleSave(CommandSender sender) {
+        if (plugin.getPidController() == null) {
+            msg(sender, "<gray>PID 模块未加载。");
+            return;
+        }
         int dirty = plugin.getPidController().getDirtyQueueSize();
         if (dirty == 0) {
             msg(sender, "<gray>没有需要刷写的脏数据。");
@@ -267,7 +295,9 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
         }
         if (args.length == 2) {
             if (args[0].equalsIgnoreCase("check")) return null;
-            if (args[0].equalsIgnoreCase("inspect")) return filter(args[1], plugin.getIntegrationManager().getMonitoredItems());
+            if (args[0].equalsIgnoreCase("inspect") && plugin.getIntegrationManager() != null) {
+                return filter(args[1], plugin.getIntegrationManager().getMonitoredItems());
+            }
         }
         return Collections.emptyList();
     }
