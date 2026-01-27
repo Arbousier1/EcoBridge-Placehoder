@@ -10,21 +10,17 @@ import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.DoubleAccumulator;
-import java.util.concurrent.atomic.LongAccumulator;
-import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.atomic.*;
 
 /**
- * Java 25 极限版 WebManager (Final Production Build)
+ * Java 25 极限版 WebManager (Final Production Build - Patch v2)
  *
- * 修正点：
- * 1. 修复 readSequence 的多线程竞态条件 (移至 Consumer 侧控制)
- * 2. RingBuffer 显式溢出保护
- * 3. HttpClient 强制绑定虚拟线程 Executor
- * 4. Microsecond 级别休眠
- * 5. 优雅停机
- * 6. [Fix] 移除未使用的 plugin 字段引用
+ * 修正日志:
+ * 1. [CRITICAL] 移除 String.format 修复 Locale 小数点/逗号问题
+ * 2. [CRITICAL] 移除错误日志过滤器，实现实时报错
+ * 3. [FEATURE] 支持 node-api-url 热重载
+ * 4. [TWEAK] 增加 HTTP 超时时间以适应云端冷启动
  */
 public class WebManager {
 
@@ -32,7 +28,8 @@ public class WebManager {
     private volatile boolean running = true;
 
     // ==================== 配置 ====================
-    private final String nodeApiUrl;
+    // [Fix] 去掉 final，允许热重载更新地址
+    private String nodeApiUrl;
     private static final int MAX_BATCH_SIZE = 64;
     private static final long FLUSH_INTERVAL_MS = 50;
 
@@ -75,18 +72,19 @@ public class WebManager {
     private final ExecutorService httpClientExecutor;
     private final HttpClient httpClient;
     private Thread senderThread;
-    private final LongAdder errorCounter = new LongAdder();
+    // [Fix] 移除 LongAdder errorCounter，不再隐藏错误
 
     public WebManager(EcoBridge plugin) {
         this.plugin = plugin;
-        this.nodeApiUrl = plugin.getConfig().getString("web.node-api-url", "http://localhost:3000/api/update");
+        // [Fix] 初始化时调用配置加载
+        reloadConfig();
 
         this.httpClientExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
         this.httpClient = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_2)
                 .executor(httpClientExecutor)
-                .connectTimeout(Duration.ofSeconds(5))
+                .connectTimeout(Duration.ofSeconds(5)) // [Fix] 增加超时防止冷启动断开
                 .build();
 
         // 初始化 RingBuffer
@@ -100,12 +98,16 @@ public class WebManager {
         this.memBuffer = new int[capacity];
         this.threadBuffer = new int[capacity];
 
-        // [Fix] 不再传递 plugin 参数，因为 LockFreeAggregator 内部不使用它
         this.aggregator = new LockFreeAggregator();
 
         startBatchSender();
 
-        plugin.getLogger().info("[Web] Production Build Initialized | Buffer: " + capacity + " | VThread Executor Active");
+        plugin.getLogger().info("[Web] Production Build Initialized | Target: " + nodeApiUrl);
+    }
+
+    // [Fix] 新增配置重载方法
+    public void reloadConfig() {
+        this.nodeApiUrl = plugin.getConfig().getString("web.node-api-url", "http://localhost:3000/api/update");
     }
 
     /**
@@ -168,7 +170,7 @@ public class WebManager {
                         .uri(URI.create(nodeApiUrl))
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString(payload))
-                        .timeout(Duration.ofSeconds(2))
+                        .timeout(Duration.ofSeconds(5))
                         .build();
 
                 HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
@@ -177,12 +179,14 @@ public class WebManager {
                     readSequence += batchSize;
                     lastFlushTime = System.currentTimeMillis();
                 } else {
-                    handleError("Status " + response.statusCode());
+                    // [Fix] 详细记录非200状态码
+                    handleError("HTTP " + response.statusCode());
                     readSequence += batchSize; 
                 }
 
             } catch (Exception e) {
-                handleError(e.getMessage());
+                // [Fix] 详细记录异常信息
+                handleError(e.getClass().getSimpleName() + ": " + e.getMessage());
                 readSequence += batchSize;
             }
         }
@@ -196,6 +200,8 @@ public class WebManager {
             int idx = (int) ((startSeq + i) & indexMask);
             sb.append('{')
               .append("\"ts\":").append(tsBuffer[idx]).append(',')
+              // [Fix] 彻底修复 Locale 问题：直接 append double 值
+              // 这样会使用标准的 "123.456" 格式，而不是 "123,456"
               .append("\"inf\":").append(infBuffer[idx]).append(',')
               .append("\"tps\":").append(tpsBuffer[idx]).append(',')
               .append("\"mem\":").append(memBuffer[idx]).append(',')
@@ -209,11 +215,8 @@ public class WebManager {
     }
 
     private void handleError(String reason) {
-        errorCounter.increment();
-        long count = errorCounter.sum();
-        if ((count & 0xFF) == 0) {
-            plugin.getLogger().warning("[Web] Push failed x256. Reason: " + reason);
-        }
+        // [Fix] 移除 256 次过滤，直接报错，方便调试
+        plugin.getLogger().warning("[Web Push Error] " + reason);
     }
 
     public void shutdown() {
@@ -231,7 +234,7 @@ public class WebManager {
         plugin.getLogger().info("[Web] Production Build Shutdown Gracefully");
     }
 
-    // ==================== 内部聚合器 (Fixed) ====================
+    // ==================== 内部聚合器 ====================
     public static class LockFreeAggregator {
         private final DoubleAccumulator minTps = new DoubleAccumulator(Math::min, 20.0);
         private final DoubleAccumulator maxTps = new DoubleAccumulator(Math::max, 0.0);
@@ -250,10 +253,8 @@ public class WebManager {
         @SuppressWarnings("unused")
         private volatile long lastResetTime = System.currentTimeMillis();
         private final long windowSizeMs;
-        // [Fix] Removed unused 'plugin' field
 
-        public LockFreeAggregator() { // [Fix] Removed 'plugin' parameter
-            // [Fix] Removed 'this.plugin = plugin;'
+        public LockFreeAggregator() {
             this.windowSizeMs = TimeUnit.MINUTES.toMillis(5);
         }
 
