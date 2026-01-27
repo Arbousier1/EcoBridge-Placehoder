@@ -8,8 +8,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.StampedLock;
 
 /**
- * 极致性能 PID 控制器 (最终修复版)
- * 融合了 API 完整性与数学精度优化 (FMA)
+ * 极致性能 PID 控制器 (内存安全修复版)
+ * 修复: 移除 ThreadLocal 以适配 Virtual Thread 模型
  */
 public class PidController implements AutoCloseable {
 
@@ -43,7 +43,9 @@ public class PidController implements AutoCloseable {
     private final ConcurrentHashMap<String, Integer> registry = new ConcurrentHashMap<>(4096);
     private final ConcurrentHashMap<Integer, String> handleToId = new ConcurrentHashMap<>(4096);
     private final AtomicBoolean closed = new AtomicBoolean(false);
-    private final ThreadLocal<CalcContext> tlContext = ThreadLocal.withInitial(CalcContext::new);
+    
+    // [修复] 移除 ThreadLocal，直接在栈上分配
+    // private final ThreadLocal<CalcContext> tlContext = ThreadLocal.withInitial(CalcContext::new);
 
     // ==================== DTO 定义 ====================
     public record PidStateDto(double integral, double lastError, double lastLambda, long updateTime) {}
@@ -56,7 +58,6 @@ public class PidController implements AutoCloseable {
             this.segments[i] = new Segment(arena);
         }
         loadConfig();
-        // [修复] 添加初始化日志，方便排查 SIMD 是否生效
         plugin.getLogger().info("[PID] Controller Initialized. Vector Lane: " + V_LEN + ", Target: " + target);
     }
 
@@ -106,14 +107,10 @@ public class PidController implements AutoCloseable {
 
     // ==================== 4. 业务 API ====================
 
-    /**
-     * 主计算入口
-     */
     public EcoBridge.CalculationResult calculate(EcoBridge.MarketSnapshot snapshot) {
         if (closed.get() || snapshot.validItemCount() == 0) {
             return new EcoBridge.CalculationResult(0.0, base);
         }
-        // 调用内部批量计算逻辑并返回 Lambda 总和
         double totalLambda = calculateBatchInternal(snapshot.itemHandles(), snapshot.itemDeltas(), snapshot.validItemCount());
         double avgLambda = totalLambda / snapshot.validItemCount();
         return new EcoBridge.CalculationResult(avgLambda, avgLambda * 10.0);
@@ -128,7 +125,6 @@ public class PidController implements AutoCloseable {
             try {
                 int slot = seg.allocateSlot();
                 if (slot < 0) {
-                    // [修复] 增加溢出警告
                     plugin.getLogger().warning("[PID] Segment " + segId + " overflow when allocating: " + itemId);
                     return -1;
                 }
@@ -202,9 +198,6 @@ public class PidController implements AutoCloseable {
         }
     }
 
-    /**
-     * 基准测试专用
-     */
     public void calculateBatch(int[] handles, double[] volumes, int count) {
         calculateBatchInternal(handles, volumes, count);
     }
@@ -212,8 +205,9 @@ public class PidController implements AutoCloseable {
     // ==================== 6. 核心计算逻辑 ====================
 
     private double calculateBatchInternal(int[] handles, double[] volumes, int count) {
-        CalcContext ctx = tlContext.get();
-        ctx.reset();
+        // [修复] 栈上分配 Context，避免 VirtualThread 下的 ThreadLocal 浪费
+        CalcContext ctx = new CalcContext(); 
+        
         for (int i = 0; i < count; i++) {
             int h = handles[i];
             if (h == -1) continue;
@@ -305,7 +299,7 @@ public class PidController implements AutoCloseable {
                 double err = vols[i] - target;
                 if (Math.abs(err) < deadband) err = 0.0;
 
-                // [修复] 补回 Math.fma 优化
+                // FMA 优化
                 integral = integral * (1.0 - dt * tau);
                 integral = Math.fma(err, dt, integral);
                 integral = Math.max(integralMin, Math.min(integralMax, integral));
@@ -371,17 +365,21 @@ public class PidController implements AutoCloseable {
         final int[] counts = new int[SEGMENT_COUNT];
         final double[] vBufState = new double[4 * V_LEN];
 
-        void reset() { Arrays.fill(counts, 0); }
+        // 构造时自动分配，无需 reset
+        CalcContext() {
+            Arrays.fill(counts, 0); 
+        }
+
         void push(int segId, int slot, double vol) {
             int idx = counts[segId]++;
             if (idx >= segSlots[segId].length) grow(segId);
             segSlots[segId][idx] = slot;
             segVols[segId][idx] = vol;
         }
+
         void grow(int segId) {
             int old = segSlots[segId].length;
             if (old >= MAX_CAPACITY) return;
-            // [优化] 使用更激进的扩容策略减少 resize 次数
             int cap = Math.min(old << 1, MAX_CAPACITY);
             segSlots[segId] = Arrays.copyOf(segSlots[segId], cap);
             segVols[segId] = Arrays.copyOf(segVols[segId], cap);
