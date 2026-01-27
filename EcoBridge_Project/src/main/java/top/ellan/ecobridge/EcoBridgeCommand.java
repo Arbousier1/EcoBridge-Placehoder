@@ -73,24 +73,41 @@ public class EcoBridgeCommand implements CommandExecutor, TabCompleter {
     }
 
     private void handleReload(CommandSender sender) {
-        msg(sender, "<yellow>⟳ 正在异步重载全系统模块（含 PID 参数）...");
+        msg(sender, "<yellow>⟳ 正在执行热重载...");
+        long start = System.currentTimeMillis();
+
+        // 1. [Sync] 必须在主线程执行的操作 (Config, Arrays)
+        // 这一步非常快，不会卡顿服务器
+        try {
+            plugin.reloadConfig(); // Bukkit Config API 必须主线程
+            plugin.getPidController().reloadConfig(); 
+            
+            // 关键修复：syncShops 修改数组引用，必须与 captureDataSnapshot 互斥 (同在主线程)
+            plugin.getIntegrationManager().syncShops(); 
+            
+        } catch (Exception e) {
+            msg(sender, "<red>✗ 配置/内存重载失败: " + e.getMessage());
+            e.printStackTrace();
+            return;
+        }
+
+        // 2. [Async] 可以/应该异步执行的操作 (I/O, Network)
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
-            long start = System.currentTimeMillis();
             try {
-                plugin.reloadConfig();
-
-                // 重载 PID 参数
-                plugin.getPidController().reloadConfig();
-
-                // 重载其他模块
-                plugin.getIntegrationManager().syncShops();
+                // 刷新网络缓存
                 plugin.getMarketManager().updateHolidayCache();
+                // 重新计算经济指标
                 plugin.getMarketManager().updateEconomyMetrics();
                 plugin.getMarketManager().updateMarketFlux();
 
-                msg(sender, "<green>✓ 重载成功! 耗时: <white>" + (System.currentTimeMillis() - start) + "ms");
+                // 回调主线程发送完成消息
+                Bukkit.getScheduler().runTask(plugin, () -> 
+                    msg(sender, "<green>✓ 重载成功! 耗时: <white>" + (System.currentTimeMillis() - start) + "ms")
+                );
             } catch (Exception e) {
-                msg(sender, "<red>✗ 重载失败: " + e.getMessage());
+                Bukkit.getScheduler().runTask(plugin, () -> 
+                    msg(sender, "<red>✗ 异步数据刷新失败: " + e.getMessage())
+                );
                 e.printStackTrace();
             }
         });
