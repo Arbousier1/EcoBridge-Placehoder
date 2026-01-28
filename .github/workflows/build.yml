@@ -27,7 +27,7 @@ jobs:
       # [核心修正] 在子目录中生成并检查 Gradle Wrapper
       - name: Setup Gradle and Generate Wrapper
         # 请根据你的实际目录结构修改下面的 working-directory
-        working-directory: ./EcoBridge_Project 
+        working-directory: ./
         run: |
           if [ ! -f gradlew ]; then
             echo "Gradlew not found in subdirectory, generating wrapper..."
