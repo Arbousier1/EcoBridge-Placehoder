@@ -1,4 +1,4 @@
-name: Auto-Fix and Build EcoBridge
+name: Build EcoBridge
 
 on:
   push:
@@ -24,35 +24,34 @@ jobs:
           distribution: 'oracle'
           cache: 'gradle'
 
-      # [核心修正] 在子目录中生成并检查 Gradle Wrapper
       - name: Setup Gradle and Generate Wrapper
-        # 请根据你的实际目录结构修改下面的 working-directory
-        working-directory: ./
         run: |
+          # 检查根目录下是否有 gradlew，没有则生成
           if [ ! -f gradlew ]; then
-            echo "Gradlew not found in subdirectory, generating wrapper..."
+            echo "Gradlew not found, generating wrapper..."
             gradle wrapper --gradle-version 9.3.0
           fi
           chmod +x gradlew
 
-      - name: Build with Gradle (SIMD Optimized)
-        # 同样需要指定工作目录
-        working-directory: ./EcoBridge_Project
+      - name: Build with Gradle (shadowJar)
+        # 直接在根目录运行，不再需要 working-directory
         run: ./gradlew shadowJar --no-daemon
 
       - name: Extract Build Metadata
         id: metadata
-        working-directory: ./EcoBridge_Project
         run: |
-          # 在子目录的 build/libs 下寻找生成的 jar
-          JAR_FILE=$(find build/libs -name "*.jar" | head -n 1)
-          echo "jar_path=EcoBridge_Project/$JAR_FILE" >> $GITHUB_OUTPUT
+          # 在 build/libs 目录下寻找生成的 jar 文件
+          JAR_FILE=$(find build/libs -name "*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" | head -n 1)
+          if [ -z "$JAR_FILE" ]; then
+            echo "Error: No JAR file found in build/libs"
+            exit 1
+          fi
+          echo "jar_path=$JAR_FILE" >> $GITHUB_OUTPUT
           echo "jar_name=$(basename $JAR_FILE)" >> $GITHUB_OUTPUT
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.metadata.outputs.jar_name }}
-          # 路径需要从根目录开始算起
           path: ${{ steps.metadata.outputs.jar_path }}
           retention-days: 5
