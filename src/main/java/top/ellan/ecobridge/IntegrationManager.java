@@ -10,8 +10,9 @@ import org.bukkit.Bukkit;
 import java.util.*;
 
 /**
- * 集成管理器 - 极致性能最终版
+ * 集成管理器 - 极致性能最终版 (已修正买卖逻辑)
  * 特性：Direct Memory Access, Array-based Indexing, Snapshot Architecture
+ * 逻辑变更：现在使用 (买入 - 卖出) 计算净流量，实现供需平衡。
  */
 public class IntegrationManager {
 
@@ -27,7 +28,7 @@ public class IntegrationManager {
     // 原生数组，CPU 缓存友好，无 List overhead
     private volatile FastItemEntry[] fastEntries = new FastItemEntry[0];
 
-    // 记录上一 Tick 的总量：Index = Handle, Value = TotalVolume
+    // 记录上一 Tick 的净总量：Index = Handle, Value = NetVolume (Buy - Sell)
     // 扩容策略：在 syncShops 中按最大 Handle ID + Padding 分配
     private double[] lastTotalVolumes = new double[0];
 
@@ -72,14 +73,17 @@ public class IntegrationManager {
             if (entry == null || entry.dataCache == null) continue;
 
             try {
-                // [优化] 直接读取内存值，无方法调用开销
-                double currentTotal = entry.dataCache.getBuyUseTimes() + entry.dataCache.getSellUseTimes();
+                // [关键修改] 使用减法计算净流量 (Net Flow)
+                // 正数 = 净买入 (需涨价)，负数 = 净卖出 (需降价)
+                double currentTotal = entry.dataCache.getBuyUseTimes() - entry.dataCache.getSellUseTimes();
                 int handle = entry.pidHandle;
 
                 // [优化] 数组直接寻址 O(1)，无 Map 哈希开销
                 double lastTotal = lastTotalVolumes[handle];
                 
-                // 计算增量 (本 tick 交易量)
+                // 计算增量 (本 tick 的净变化量)
+                // 例如：之前净买入100，现在净买入105 -> delta = +5 (买入增加)
+                // 例如：之前净买入100，现在净买入90 (有人卖了10个) -> delta = -10 (卖出压力)
                 double delta = currentTotal - lastTotal;
 
                 // Write Back 更新历史状态
@@ -171,7 +175,9 @@ public class IntegrationManager {
         // 3. 初始化新加入物品的 LastTotal
         // 防止：新物品加入时，Total 是 1000，Last 是 0 -> Delta 瞬间变 1000 -> 经济崩溃
         for (FastItemEntry entry : tempEntries) {
-             double current = entry.dataCache.getBuyUseTimes() + entry.dataCache.getSellUseTimes();
+             // [关键修改] 这里也必须改为减法，保持与 captureDataSnapshot 逻辑一致
+             double current = entry.dataCache.getBuyUseTimes() - entry.dataCache.getSellUseTimes();
+             
              // 只有当该 Handle 的历史数据为 0 (说明是新的或者之前没数据) 时才初始化
              if (lastTotalVolumes[entry.pidHandle] == 0) {
                  lastTotalVolumes[entry.pidHandle] = current;
