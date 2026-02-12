@@ -8,15 +8,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.StampedLock;
 
 /**
- * 极致性能 PID 控制器 (Java 25 Vector API 合规终极修复版)
- * 
- * ✅ 核心修复：
- *   - convertShape 返回值显式强转为 DoubleVector（解决 Type mismatch）
- *   - 修正 fma 参数顺序：vErr.fma(vKpUsed, ...) → vKpUsed.fma(vErr, ...) 语义更清晰
- *   - 所有向量操作显式使用 DoubleVector/LongVector（杜绝 Vector<Double> 误用）
- *   - 保留物种长度安全校验（启动时验证）
- *   - 零分配 ThreadLocal 重用
- *   - 严格遵循 Panama FFM + Vector API 规范
+ * 极致性能 PID 控制器 (Java 25 Vector API 合规终极修复版 + 买卖平衡逻辑)
+ * * ✅ 核心特性：
+ * - 支持买卖平衡逻辑 (Target = 0, Lambda 可负)
+ * - Panama FFM + Vector API 深度优化
+ * - convertShape 类型安全修复
+ * - 零分配 ThreadLocal 重用
  */
 public class PidController implements AutoCloseable {
     // ==================== 1. 向量化与常量配置 (精简合规) ====================
@@ -88,20 +85,24 @@ public class PidController implements AutoCloseable {
 
     private void loadConfig() {
         var cfg = plugin.getConfig();
-        this.target = cfg.getDouble("pid.target", 1000.0);
+        // [修改] 默认 Target 为 0 (追求买卖平衡)
+        this.target = cfg.getDouble("pid.target", 0.0);
         this.deadband = cfg.getDouble("pid.deadband", 20.0);
         this.kp = cfg.getDouble("pid.kp", 0.00001);
         this.kpNegMultiplier = cfg.getDouble("pid.kp-negative-multiplier", 0.6);
         this.ki = cfg.getDouble("pid.ki", 0.000001);
         this.kd = cfg.getDouble("pid.kd", 0.00005);
-        this.base = cfg.getDouble("pid.base", 0.002);
+        // [修改] 默认 Base 为 0
+        this.base = cfg.getDouble("pid.base", 0.0);
         this.alpha = cfg.getDouble("pid.alpha", 0.05);
         this.beta = cfg.getDouble("pid.beta", 0.95);
         this.tau = cfg.getDouble("pid.tau", 0.00001929);
         this.integralMax = cfg.getDouble("pid.integral-max", 30000.0);
+        // [修改] 允许负积分
         this.integralMin = cfg.getDouble("pid.integral-min", -30000.0);
         this.lambdaMax = cfg.getDouble("pid.lambda-max", 0.01);
-        this.lambdaMin = cfg.getDouble("pid.lambda-min", 0.0005);
+        // [修改] 允许负 Lambda (实现降价)
+        this.lambdaMin = cfg.getDouble("pid.lambda-min", -0.01);
         this.dtMax = cfg.getDouble("pid.dt-max", 1.0);
         this.dtMin = cfg.getDouble("pid.dt-min", 0.05);
         
@@ -294,8 +295,7 @@ public class PidController implements AutoCloseable {
 
     /**
      * Segment 级别 SIMD 处理 (合规终极方案)
-     * 
-     * 关键修复:
+     * * 关键修复:
      * 1. convertShape 返回值显式强转为 DoubleVector（解决编译错误）
      * 2. fma 参数顺序修正：kpUsed * err + ... 语义更清晰
      * 3. 所有向量操作显式使用具体子类类型
@@ -445,7 +445,8 @@ public class PidController implements AutoCloseable {
             for (int i = 0; i < CAPACITY; i += 512) {
                 integrals.setAtIndex(D_LAYOUT, i, 0.0);
                 errors.setAtIndex(D_LAYOUT, i, 0.0);
-                lambdas.setAtIndex(D_LAYOUT, i, 0.002);
+                // [修改] 初始 Lambda 设为 0 (无价格偏差)
+                lambdas.setAtIndex(D_LAYOUT, i, 0.0);
                 times.setAtIndex(L_LAYOUT, i, 0L);
                 dirty.setAtIndex(B_LAYOUT, i, (byte) 0);
             }
@@ -455,7 +456,8 @@ public class PidController implements AutoCloseable {
             int slot = allocationMap.nextClearBit(0);
             if (slot >= CAPACITY) return -1;
             allocationMap.set(slot);
-            lambdas.setAtIndex(D_LAYOUT, slot, 0.002);
+            // [修改] 初始 Lambda 设为 0
+            lambdas.setAtIndex(D_LAYOUT, slot, 0.0);
             times.setAtIndex(L_LAYOUT, slot, System.currentTimeMillis());
             return slot;
         }
