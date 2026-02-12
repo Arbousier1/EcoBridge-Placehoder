@@ -88,14 +88,11 @@ public class IntegrationManager {
                 // ====================================================================
                 // 【关键改进】从 TransactionAmountCache 获取实际交易数量
                 // 
-                // 旧逻辑（错误）：
-                //   double currentTotal = entry.dataCache.getSellUseTimes() 
-                //                       - entry.dataCache.getBuyUseTimes();
-                //   → 返回的是"交易次数"，卖出2304个也是1次
-                // 
-                // 新逻辑（正确）：
-                //   从 TransactionAmountCache 获取实际数量
-                //   → 卖出2304个就是2304
+                // 市场压力方向（取负值）：
+                //   - 玩家卖出物品 → rawDelta > 0 (sell 增加)
+                //     → 供应增加 → 价格应下降 → delta 为负
+                //   - 玩家买入物品 → rawDelta < 0 (buy 增加)  
+                //     → 需求增加 → 价格应上涨 → delta 为正
                 // ====================================================================
                 
                 double currentTotal = 0;
@@ -104,16 +101,19 @@ public class IntegrationManager {
                 TransactionAmountCache.AmountCounter counter = amountCache.get(entry.itemId);
                 if (counter != null) {
                     // 净流量 = 卖出数量 - 买入数量
-                    // 正值：供应增加，价格下降
-                    // 负值：需求增加，价格上涨
                     currentTotal = counter.getNetFlow();
                 }
 
                 int handle = entry.pidHandle;
                 double lastTotal = lastTotalVolumes[handle];
                 
-                // 计算增量
-                double delta = currentTotal - lastTotal;
+                // 计算原始增量
+                double rawDelta = currentTotal - lastTotal;
+                
+                // 【关键】取负值，转换为市场压力方向
+                // 卖出压力（rawDelta > 0）→ 价格下降 → delta 为负
+                // 买入需求（rawDelta < 0）→ 价格上涨 → delta 为正
+                double delta = -rawDelta;
 
                 // Write Back 更新历史状态
                 lastTotalVolumes[handle] = currentTotal;

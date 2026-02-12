@@ -63,11 +63,15 @@ public class TransactionAmountCache {
     private final ConcurrentHashMap<String, AmountCounter> cache = new ConcurrentHashMap<>(4096);
     
     // 单例模式
-    private static TransactionAmountCache instance;
+    private static volatile TransactionAmountCache instance;
     
-    public static synchronized TransactionAmountCache getInstance() {
+    public static TransactionAmountCache getInstance() {
         if (instance == null) {
-            instance = new TransactionAmountCache();
+            synchronized (TransactionAmountCache.class) {
+                if (instance == null) {
+                    instance = new TransactionAmountCache();
+                }
+            }
         }
         return instance;
     }
